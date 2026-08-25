@@ -166,5 +166,7 @@ FREETOKEN_CPU_THREADS=12
   54 percent hit rate over a 16-token run.
 - Larger cache sizes provide diminishing returns.
 - First-token latency is high for prompts selecting many unique experts.
-- An asynchronous prefetch pipeline could hide part of the expert-read and
-  upload latency, but is not implemented.
+- Naive next-token expert prefetch was rejected after cache-aware simulation:
+  speculative uploads outweighed prevented misses.
+- The next architectural phase is GPU-resident decode with one submission per
+  layer. See [gpu_resident_decode_plan.md](gpu_resident_decode_plan.md).

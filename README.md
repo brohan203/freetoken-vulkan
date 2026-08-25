@@ -164,6 +164,13 @@ Every kernel in this repo was validated against a pure-PyTorch reference on real
 | KV attention vs full-prefill (bit-exact test) | 0.000e+00 |
 | One-layer end-to-end vs pure-PyTorch reference | 4.27e-03 (25M+ FMAs of FP32 accum drift, expected) |
 
+## Next performance phase
+
+The current decode architecture still moves activations between PyTorch and
+Vulkan at layer boundaries. The phased plan for resident activation buffers,
+resident projections, one-submit layers, and dedicated transfer-queue overlap
+is documented in [docs/gpu_resident_decode_plan.md](docs/gpu_resident_decode_plan.md).
+
 ## What's NOT here - and why
 
 - No batched-submit implementation. We measured the current ceiling at approximately 18 ms per Vulkan submit-execute-fence-signal round-trip on RDNA2/Windows AMD driver. Breaking that requires keeping activations in VRAM across kernels and issuing 1-2 submits per layer instead of approximately 4. Well-scoped, not built.
