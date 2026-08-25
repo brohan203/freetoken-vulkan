@@ -85,6 +85,7 @@ Representative results:
 | Previous row + two-stage parallel MoE | 5 / 16 | 6.7 s | 0.54 s/token | 15.4 s |
 | Two-stage parallel MoE, 48 tokens | 5 / 48 | 5.9 s | 0.506 s/token | 29.7 s |
 | Previous row + CPU decode attention | 5 / 48 | 6.2 s | 0.486 s/token | 29.1 s |
+| Previous row + parallel staging memcpy | 5 / 48 | 4.3 s | 0.394 s/token | 22.8 s |
 | 28-slot GPU cache + mmap expert rows | 5 / 16 | 7.7 s | 2.3 s/token | 41.8 s |
 
 Twenty-four slots are the default because 28 slots consume more VRAM without a
@@ -151,6 +152,10 @@ FREETOKEN_CPU_THREADS=12
   cache are already CPU tensors. At context lengths 8 through 512 this was
   1.2-1.7 times faster than three small Vulkan calls, with max difference below
   `2.3e-8`. Prefill remains on the Vulkan attention path.
+- Expert-cache miss staging maps Vulkan buffers on the calling thread, then
+  fills the disjoint mapped ranges in parallel C++ tasks before one copy
+  submission. Over a 48-token run, measured miss-upload time fell from about
+  14.2 seconds to 6.9 seconds while preserving identical tokens.
 - Expert choices remain broad over 128 experts; a 24-slot cache reached about a
   54 percent hit rate over a 16-token run.
 - Larger cache sizes provide diminishing returns.

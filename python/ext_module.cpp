@@ -18,6 +18,7 @@
 #include <string>
 #include <cstdlib>
 #include <memory>
+#include <future>
 #include <unordered_map>
 
 #include "vk_util.hpp"
@@ -113,8 +114,12 @@ void upload_resident_batch_vulkan(
     auto& ctx = get_ctx();
     std::vector<torch::Tensor> contiguous;
     std::vector<vku::Buffer> staging;
+    std::vector<void*> mapped;
+    std::vector<size_t> bytes;
     contiguous.reserve(tensors.size());
     staging.reserve(tensors.size());
+    mapped.reserve(tensors.size());
+    bytes.reserve(tensors.size());
 
     for (size_t i = 0; i < tensors.size(); ++i) {
         TORCH_CHECK(tensors[i].device().is_cpu(), "resident upload tensor must be on CPU");
@@ -122,24 +127,38 @@ void upload_resident_batch_vulkan(
         auto it = g_resident.find(handles[i]);
         TORCH_CHECK(it != g_resident.end(), "resident buffer handle not found: ", handles[i]);
         contiguous.push_back(tensors[i].contiguous());
-        const size_t bytes = (size_t)contiguous.back().numel() * contiguous.back().element_size();
-        TORCH_CHECK((size_t)offsets[i] + bytes <= (size_t)it->second.size,
+        size_t n = (size_t)contiguous.back().numel() * contiguous.back().element_size();
+        TORCH_CHECK((size_t)offsets[i] + n <= (size_t)it->second.size,
                     "resident batch upload exceeds destination capacity");
-        staging.push_back(get_pool().acquire_host(bytes));
-        vku::upload(ctx, staging.back(), contiguous.back().data_ptr(), bytes);
+        bytes.push_back(n);
+        staging.push_back(get_pool().acquire_host(n));
+        void* pointer = nullptr;
+        VKU_CHECK(vkMapMemory(ctx.device, staging.back().mem, 0, n, 0, &pointer));
+        mapped.push_back(pointer);
+    }
+
+    std::vector<std::future<void>> copies;
+    copies.reserve(tensors.size());
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        copies.push_back(std::async(std::launch::async, [&, i] {
+            std::memcpy(mapped[i], contiguous[i].data_ptr(), bytes[i]);
+        }));
+    }
+    for (auto& copy : copies) copy.get();
+    for (size_t i = 0; i < staging.size(); ++i) {
+        vkUnmapMemory(ctx.device, staging[i].mem);
     }
 
     vku::submit_and_wait(ctx, [&](VkCommandBuffer cmd) {
         for (size_t i = 0; i < tensors.size(); ++i) {
-            const size_t bytes = (size_t)contiguous[i].numel() * contiguous[i].element_size();
             VkBufferCopy copy{};
             copy.srcOffset = 0;
             copy.dstOffset = (VkDeviceSize)offsets[i];
-            copy.size = (VkDeviceSize)bytes;
-            vkCmdCopyBuffer(cmd, staging[i].buf, g_resident.at(handles[i]).buf, 1, &copy);
+            copy.size = (VkDeviceSize)bytes[i];
+            vkCmdCopyBuffer(cmd, staging[i].buf,
+                            g_resident.at(handles[i]).buf, 1, &copy);
         }
     });
-
     for (auto& buffer : staging) get_pool().release_host(buffer);
 }
 
