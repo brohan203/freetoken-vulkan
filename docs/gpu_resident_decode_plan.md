@@ -45,6 +45,27 @@ Memory budget:
 - temporary normalized buffer: `2880 * 4` bytes;
 - negligible relative to weight caches.
 
+### Phase 1 status
+
+Implemented and validated:
+
+- owned `ResidentTensor` FP32 handles;
+- resident download through a pooled transfer buffer;
+- handle-based resident RMSNorm;
+- handle-based resident residual add;
+- explicit free/context-manager lifecycle and allocation accounting.
+
+Correctness:
+
+- random RMSNorm max error `4.77e-7`;
+- resident add is bit-exact against its resident input;
+- real 20b activation RMSNorm max error `1.91e-6`;
+- allocation counter returns to baseline after explicit free.
+
+Isolated RMSNorm + add remains slower than CPU (`0.209 ms` vs `0.063 ms`)
+because it pays two submissions. Phase 2/3 must batch resident operations for the
+infrastructure to improve model latency.
+
 ## Phase 2: resident projections and router
 
 Move decode-time Q, K, V, O, and router matvecs onto Vulkan.

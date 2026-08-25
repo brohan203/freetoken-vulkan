@@ -172,7 +172,9 @@ inline void destroy_buffer(const Context& ctx, Buffer& b) {
 // Real perf work will use device-local + staging buffers.
 inline Buffer make_host_ssbo(const Context& ctx, VkDeviceSize size) {
     return make_buffer(ctx, size,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+            | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+            | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 

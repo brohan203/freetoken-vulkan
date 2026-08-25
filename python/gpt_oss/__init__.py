@@ -14,6 +14,7 @@ from .loader import (
 )
 from .model import GptOssModel
 from .resident import ResidentLayerHandles, ResidentMoEWeights
+from .resident_tensor import ResidentTensor
 from .rope import compute_cos_sin_for_positions
 from .streaming_resident import StreamedResidentMoECache
 
@@ -32,6 +33,7 @@ __all__ = [
     "GptOssModel",
     "ResidentLayerHandles",
     "ResidentMoEWeights",
+    "ResidentTensor",
     "compute_cos_sin_for_positions",
     "StreamedResidentMoECache",
 ]

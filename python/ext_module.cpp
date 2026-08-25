@@ -54,6 +54,14 @@ struct KernelPipeline {
 // Cache by shader filename.
 static std::unordered_map<std::string, std::unique_ptr<KernelPipeline>> g_pipe_cache;
 
+static KernelPipeline& get_pipeline(const std::string& shader_name,
+                                    uint32_t num_bindings,
+                                    uint32_t push_const_size);
+static double run_kernel(const KernelPipeline& pipe,
+                         const std::vector<VkBuffer>& buffers,
+                         const void* push_const_data,
+                         uint32_t gx, uint32_t gy, uint32_t gz);
+
 // ============================================================
 // Global buffer pool. Recycles HOST_VISIBLE buffers across kernel calls
 // so we don't hammer vkAllocateMemory / vkFreeMemory. See vku::BufferPool.
@@ -101,6 +109,62 @@ int64_t allocate_resident_vulkan(int64_t bytes) {
     const int64_t h = g_next_handle++;
     g_resident.emplace(h, buf);
     return h;
+}
+
+torch::Tensor download_resident_vulkan(int64_t handle,
+                                       const std::vector<int64_t>& shape) {
+    auto it = g_resident.find(handle);
+    TORCH_CHECK(it != g_resident.end(), "resident buffer handle not found");
+    int64_t elements = 1;
+    for (int64_t dim : shape) {
+        TORCH_CHECK(dim >= 0, "resident shape dimensions must be non-negative");
+        elements *= dim;
+    }
+    const size_t bytes = (size_t)elements * sizeof(float);
+    TORCH_CHECK(bytes <= (size_t)it->second.size,
+                "resident download exceeds buffer capacity");
+    auto output = torch::empty(shape, torch::TensorOptions().dtype(torch::kFloat32));
+    auto& ctx = get_ctx();
+    vku::Buffer staging = get_pool().acquire_host(bytes);
+    vku::submit_and_wait(ctx, [&](VkCommandBuffer cmd) {
+        VkBufferCopy copy{};
+        copy.size = (VkDeviceSize)bytes;
+        vkCmdCopyBuffer(cmd, it->second.buf, staging.buf, 1, &copy);
+    });
+    vku::download(ctx, staging, output.data_ptr<float>(), bytes);
+    get_pool().release_host(staging);
+    return output;
+}
+
+void rmsnorm_resident_vulkan(int64_t x_handle, int64_t weight_handle,
+                             int64_t y_handle, int64_t rows,
+                             int64_t hidden, double eps) {
+    TORCH_CHECK(rows > 0 && hidden > 0, "invalid RMSNorm shape");
+    const size_t xy_bytes = (size_t)rows * hidden * sizeof(float);
+    const size_t w_bytes = (size_t)hidden * sizeof(float);
+    TORCH_CHECK(g_resident.at(x_handle).size >= xy_bytes, "resident x too small");
+    TORCH_CHECK(g_resident.at(y_handle).size >= xy_bytes, "resident y too small");
+    TORCH_CHECK(g_resident.at(weight_handle).size >= w_bytes, "resident weight too small");
+    auto& pipe = get_pipeline("rmsnorm_f32.comp.spv", 3, 8);
+    struct PC { uint32_t H; float eps; } pc = {
+        (uint32_t)hidden, (float)eps
+    };
+    run_kernel(pipe, {resident_buf(x_handle), resident_buf(weight_handle),
+                      resident_buf(y_handle)}, &pc, (uint32_t)rows, 1, 1);
+}
+
+void add_resident_vulkan(int64_t a_handle, int64_t b_handle,
+                         int64_t out_handle, int64_t elements) {
+    TORCH_CHECK(elements > 0, "resident add element count must be positive");
+    const size_t bytes = (size_t)elements * sizeof(float);
+    TORCH_CHECK(g_resident.at(a_handle).size >= bytes, "resident a too small");
+    TORCH_CHECK(g_resident.at(b_handle).size >= bytes, "resident b too small");
+    TORCH_CHECK(g_resident.at(out_handle).size >= bytes, "resident output too small");
+    auto& pipe = get_pipeline("vector_add.comp.spv", 3, 4);
+    struct PC { uint32_t n; } pc = {(uint32_t)elements};
+    uint32_t groups = ((uint32_t)elements + 255u) / 256u;
+    run_kernel(pipe, {resident_buf(a_handle), resident_buf(b_handle),
+                      resident_buf(out_handle)}, &pc, groups, 1, 1);
 }
 
 void upload_resident_batch_vulkan(
@@ -1288,6 +1352,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("allocate_resident", &allocate_resident_vulkan,
           "Allocate an uninitialized device-local resident buffer.",
           py::arg("bytes"));
+    m.def("download_resident", &download_resident_vulkan,
+          "Download a resident FP32 buffer into a CPU tensor.",
+          py::arg("handle"), py::arg("shape"));
+    m.def("rmsnorm_resident", &rmsnorm_resident_vulkan,
+          "RMSNorm from resident buffers into a resident output buffer.",
+          py::arg("x_handle"), py::arg("weight_handle"),
+          py::arg("y_handle"), py::arg("rows"), py::arg("hidden"),
+          py::arg("eps") = 1e-5);
+    m.def("add_resident", &add_resident_vulkan,
+          "Elementwise add of resident FP32 buffers.",
+          py::arg("a_handle"), py::arg("b_handle"),
+          py::arg("out_handle"), py::arg("elements"));
     m.def("upload_resident_batch", &upload_resident_batch_vulkan,
           "Upload CPU tensors into resident-buffer subranges in one submit.",
           py::arg("handles"), py::arg("tensors"), py::arg("offsets"));
