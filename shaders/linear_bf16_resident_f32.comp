@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer WBuf { uint16_t W[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P { uint T; uint N; uint K; uint use_bias; } p;
+shared float sums[128];
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+void main(){
+ uint n=gl_WorkGroupID.x,t=gl_WorkGroupID.y,tid=gl_LocalInvocationID.x;
+ if(n>=p.N||t>=p.T)return;
+ float acc=0.0;uint wo=n*p.K,xo=t*p.K;
+ for(uint k=tid;k<p.K;k+=128u)acc=fma(X[xo+k],bf16(uint(W[wo+k])),acc);
+ sums[tid]=acc;barrier();
+ for(uint s=64u;s>0u;s>>=1u){if(tid<s)sums[tid]+=sums[tid+s];barrier();}
+ if(tid==0u)Y[t*p.N+n]=sums[0]+(p.use_bias!=0u?bf16(uint(B[n])):0.0);
+}

@@ -76,6 +76,7 @@ add_shader(attention shaders/transpose_shd_hsd_f32.comp)
 add_shader(attention shaders/rope_partial_f32.comp)
 add_shader(attention shaders/linear_fp32_resident_f32.comp)
 add_shader(attention shaders/linear_fp16_resident_f32.comp)
+add_shader(attention shaders/linear_bf16_resident_f32.comp)
 
 # ---- moe_router: phase 6 executable ----
 add_executable(moe_router src/moe_router.cpp)

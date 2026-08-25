@@ -134,9 +134,24 @@ This path still reloads every layer and performs CPU FP32 dense projections on
 every token. The performance gap is expected until weights and projections are
 resident.
 
+## Native BF16 resident linear
+
+A new Vulkan linear kernel stores checkpoint weights in native BF16 and
+reconstructs each value exactly for FP32 accumulation and output. This avoids
+both FP32's 2x VRAM expansion and FP16 conversion drift.
+
+A real layer-0 Q projection (`4096 x 2560`) was compared with CPU FP32:
+
+- maximum absolute error: `5.029e-8`
+- mean absolute error: `6.439e-9`
+- output shape and finiteness exact
+
+This primitive makes full Qwen3-4B weight residency feasible within 16 GiB.
+
 ## Next gates
 
-1. Pin Qwen3 BF16/FP32 weights resident.
-2. Replace CPU dense projections with resident Vulkan operations.
-3. Add sustained-generation stability tests.
-4. Add a Qwen3 CLI after resident decode is verified.
+1. Pin Qwen3 BF16 weights plus FP32 norm vectors resident.
+2. Build a fully resident single-token dense layer.
+3. Compare resident decode against the verified cached path.
+4. Add sustained-generation stability tests.
+5. Add a Qwen3 CLI after resident decode is verified.
