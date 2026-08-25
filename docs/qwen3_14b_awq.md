@@ -92,11 +92,28 @@ The capital of France is Paris. What is the capital of the
 - decode: `0.918 s/token`
 - steady resident bytes unchanged at `9,999,452,832`
 
-This initial path is intentionally unfused. Correctness and resident fit are
-established before AWQ layer command fusion.
+## Fused AWQ layer and stability
+
+The AWQ layer is now one command submission. The AWQ matvec maps each 128-lane
+workgroup to 128 adjacent output columns, matching the checkpoint's
+`[input, output/8]` layout and coalescing packed-weight/scale reads.
+
+Eight-token generation remains identical while performance improves:
+
+- prompt processing: `0.460 s/token`
+- decode: `0.455 s/token`
+- about 2x faster than the first resident path (`0.918 s/token`)
+
+A forced 320-token run at max sequence 384 completed with:
+
+- total runtime: `152.10 s`
+- decode average: `0.4646 s/token`
+- steady resident allocation: `10,104,310,432` bytes
+- identical resident bytes before and after generation
+- successful explicit cleanup
 
 ## Next gates
 
-1. Fuse AWQ dense-layer submissions.
-2. Run a 320-token resident stability test.
-3. Add CLI examples.
+1. Add CLI examples.
+2. Further optimize packed AWQ matvec throughput.
+3. Benchmark larger context capacities.

@@ -8,7 +8,6 @@ layout(std430,binding=2) readonly buffer SBuf { uint16_t scales[]; };
 layout(std430,binding=3) readonly buffer XBuf { float X[]; };
 layout(std430,binding=4) writeonly buffer YBuf { float Y[]; };
 layout(push_constant) uniform P { uint T;uint N;uint K;uint group_size; } p;
-shared float sums[128];
 float bf16(uint bits){return uintBitsToFloat(bits<<16u);}
 uint slot_for(uint logical){const uint slots[8]=uint[](0u,4u,1u,5u,2u,6u,3u,7u);return slots[logical];}
-void main(){uint n=gl_WorkGroupID.x,t=gl_WorkGroupID.y,tid=gl_LocalInvocationID.x;if(n>=p.N||t>=p.T)return;uint packed_cols=(p.N+7u)/8u,pack=n/8u,slot=slot_for(n&7u);float acc=0.0;for(uint k=tid;k<p.K;k+=128u){uint qw=qweight[k*packed_cols+pack],qz=qzeros[(k/p.group_size)*packed_cols+pack];float w=float((qw>>(4u*slot))&15u),z=float((qz>>(4u*slot))&15u),s=bf16(uint(scales[(k/p.group_size)*p.N+n]));acc=fma(X[t*p.K+k],(w-z)*s,acc);}sums[tid]=acc;barrier();for(uint s=64u;s>0u;s>>=1u){if(tid<s)sums[tid]+=sums[tid+s];barrier();}if(tid==0u)Y[t*p.N+n]=sums[0];}
+void main(){uint n=gl_WorkGroupID.x*128u+gl_LocalInvocationID.x,t=gl_WorkGroupID.y;if(n>=p.N||t>=p.T)return;uint packed_cols=(p.N+7u)/8u,pack=n/8u,slot=slot_for(n&7u);float acc=0.0;for(uint k=0u;k<p.K;++k){uint qw=qweight[k*packed_cols+pack],qz=qzeros[(k/p.group_size)*packed_cols+pack];float w=float((qw>>(4u*slot))&15u),z=float((qz>>(4u*slot))&15u),s=bf16(uint(scales[(k/p.group_size)*p.N+n]));acc=fma(X[t*p.K+k],(w-z)*s,acc);}Y[t*p.N+n]=acc;}
