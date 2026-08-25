@@ -25,7 +25,7 @@ MODEL_DIR = pathlib.Path(r"C:\Users\rohanborkar\Downloads\gpt-oss-120b")
 PROMPT = os.environ.get("FREETOKEN_PROMPT", "The capital of France is")
 MAX_NEW = int(os.environ.get("FREETOKEN_MAX_NEW", "6"))
 CACHE_SLOTS = int(os.environ.get("FREETOKEN_CACHE_SLOTS", "24"))
-PIN_LM_HEAD = os.environ.get("FREETOKEN_PIN_LM_HEAD", "0") == "1"
+PIN_LM_HEAD = os.environ.get("FREETOKEN_PIN_LM_HEAD", "1") == "1"
 ENABLE_GPU_CACHE = os.environ.get("FREETOKEN_GPU_CACHE", "1") == "1"
 PREFILL_CHUNK_SIZE = int(os.environ.get("FREETOKEN_PREFILL_CHUNK", "0")) or None
 

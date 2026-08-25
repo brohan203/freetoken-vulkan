@@ -125,7 +125,7 @@ void upload_resident_batch_vulkan(
         const size_t bytes = (size_t)contiguous.back().numel() * contiguous.back().element_size();
         TORCH_CHECK((size_t)offsets[i] + bytes <= (size_t)it->second.size,
                     "resident batch upload exceeds destination capacity");
-        staging.push_back(vku::make_host_ssbo(ctx, bytes));
+        staging.push_back(get_pool().acquire_host(bytes));
         vku::upload(ctx, staging.back(), contiguous.back().data_ptr(), bytes);
     }
 
@@ -140,7 +140,7 @@ void upload_resident_batch_vulkan(
         }
     });
 
-    for (auto& buffer : staging) vku::destroy_buffer(ctx, buffer);
+    for (auto& buffer : staging) get_pool().release_host(buffer);
 }
 
 void free_resident_vulkan(int64_t handle) {

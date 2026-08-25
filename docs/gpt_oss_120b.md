@@ -79,12 +79,19 @@ Representative results:
 | 24-slot GPU expert cache | 5 / 6 | 9.9 s | 3.0 s/token | 30.1 s |
 | CPU compact streaming | 5 / 16 | 14.2 s | 3.7 s/token | 69.7 s |
 | 24-slot GPU expert cache | 5 / 16 | 9.2 s | 3.1 s/token | 48.2 s |
-| 28-slot GPU expert cache | 5 / 16 | 9.8 s | 2.9 s/token | 46.1 s |
+| 24-slot GPU cache + mmap expert rows | 5 / 16 | 7.8 s | 2.3 s/token | 41.8 s |
+| 24-slot GPU cache + mmap rows + resident LM head | 5 / 16 | 6.9 s | 2.09 s/token | 38.2 s |
+| 28-slot GPU cache + mmap expert rows | 5 / 16 | 7.7 s | 2.3 s/token | 41.8 s |
 
-Twenty-four slots are the default because 28 slots consume more VRAM for only a
-small gain. Resident LM head was also tested; it fit alongside the expert cache
-but did not improve the cold-heavy short benchmark enough to justify enabling
-it by default.
+Twenty-four slots are the default because 28 slots consume more VRAM without a
+measurable gain. GPU-cache misses now upload contiguous memory-mapped expert
+rows directly into pooled Vulkan staging buffers. Only the small BF16 bias rows
+are converted to FP32. Host-visible upload staging buffers are reused through
+the Vulkan buffer pool. Together these changes reduce measured host expert
+materialization from approximately 18 seconds to approximately 0.2 seconds in
+the 16-token run. Resident LM head is now enabled by
+default because the faster expert path makes its approximately 7 percent total
+speedup measurable while fitting within the 16 GB budget.
 
 ## Running
 
@@ -110,13 +117,15 @@ Recommended defaults:
 ```text
 FREETOKEN_CACHE_SLOTS=24
 FREETOKEN_GPU_CACHE=1
-FREETOKEN_PIN_LM_HEAD=0
+FREETOKEN_PIN_LM_HEAD=1
 FREETOKEN_PREFILL_CHUNK=0
 ```
 
 ## Known limits
 
 - Decode is PCIe/disk expert-miss bound, not shader-compute bound.
+- The default tuned configuration uses about 12.8 GiB resident VRAM: 24 expert
+  slots per layer plus the resident LM head.
 - Expert choices remain broad over 128 experts; a 24-slot cache reached about a
   54 percent hit rate over a 16-token run.
 - Larger cache sizes provide diminishing returns.

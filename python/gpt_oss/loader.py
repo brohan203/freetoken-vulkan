@@ -200,6 +200,39 @@ class ExpertStore:
         local_indices = inverse.reshape_as(global_indices).contiguous()
         return ids, local_indices, available
 
+    def mapped_experts(
+        self, layer_idx: int, expert_ids: list[int]
+    ) -> Dict[int, ExpertTensors]:
+        """Return contiguous mmap-backed single-expert row views.
+
+        This avoids building compact host tensors for GPU-cache misses. The
+        Vulkan staging upload reads directly from the mapped checkpoint pages.
+        """
+        if not expert_ids:
+            return {}
+        t0 = time.perf_counter()
+        names = self._names(layer_idx)
+        full = [
+            self.sf._handle(self.sf.weight_map[name]).get_tensor(name)
+            for name in names
+        ]
+        mapped: Dict[int, ExpertTensors] = {}
+        for expert_id in expert_ids:
+            mapped[expert_id] = ExpertTensors(
+                gate_up_blocks=full[0][expert_id:expert_id + 1],
+                gate_up_scales=full[1][expert_id:expert_id + 1],
+                gate_up_bias=_bf16_to_fp32(
+                    full[2][expert_id:expert_id + 1]
+                ),
+                down_blocks=full[3][expert_id:expert_id + 1],
+                down_scales=full[4][expert_id:expert_id + 1],
+                down_bias=_bf16_to_fp32(
+                    full[5][expert_id:expert_id + 1]
+                ),
+            )
+        self.materialize_seconds += time.perf_counter() - t0
+        return mapped
+
     def load_ids(
         self, layer_idx: int, expert_ids: list[int]
     ) -> Dict[int, ExpertTensors]:

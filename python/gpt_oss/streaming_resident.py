@@ -106,7 +106,7 @@ class StreamedResidentMoECache:
         missing = [expert_id for expert_id in ids if expert_id not in resident_ids]
         self.hits += len(ids) - len(missing)
         self.misses += len(missing)
-        loaded = store.load_ids(layer_idx, missing)
+        loaded = store.mapped_experts(layer_idx, missing)
         if slab is None:
             if not missing:
                 raise RuntimeError("cannot initialize VRAM slab without an expert")
