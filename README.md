@@ -59,14 +59,17 @@ pip install torch transformers safetensors
 #    then run under a vcvars64-wrapped shell so the torch JIT ext compiles.
 ```
 
-For gpt-oss-120b, use the long-lived prompt loop so the expert cache stays
-warm across requests:
+Use the generic long-lived resident prompt loop for either checkpoint:
 
 ```powershell
-python\chat_120b.py --max-new-tokens 48 "The capital of France is"
+# Defaults to gpt-oss-20b:
+python\chat_gpt_oss.py --max-new-tokens 48 "The capital of France is"
 
-# Or start an interactive loop:
-python\chat_120b.py --max-new-tokens 48
+# Select gpt-oss-120b:
+python\chat_gpt_oss.py --model-dir C:\path\to\gpt-oss-120b \
+    --max-new-tokens 48 "The capital of France is"
+
+# Omit the prompt to start an interactive loop.
 ```
 
 Resident decode is the default: the model, FP32 LM head, all 36 layers of
@@ -124,8 +127,11 @@ Measured on Radeon RX 6800 XT, 12-token greedy generation of `"The capital of Fr
 | + KV cache | 7.6 s | 2.70 s | 21.2 s | 1.35x |
 | + Resident MoE (approximately 9.5 GB VRAM) | 1.7 s | 1.38 s | 8.6 s | 3.34x |
 | + Resident LM head (+2.2 GB VRAM) | 1.4 s | 1.20 s | 5.0 s | **5.74x** |
+| Fully resident 20b, 64-token run | CPU prefill | **0.0618 s** | **4.44 s** | exact token parity |
+| Fully resident 120b, 64-token run | CPU prefill | **0.229 s** | **15.84 s** | exact token parity |
 
-Sequence-length scaling: over 64 decode steps, per-token time grew from 1.24 s to 1.26 s (+2.0%). KV cache is working as designed.
+Long stability runs complete without resident-memory growth: 20b generated 320
+tokens at approximately 0.067 s/token and 120b at approximately 0.272 s/token.
 
 ## Architecture
 
