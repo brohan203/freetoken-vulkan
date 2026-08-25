@@ -112,8 +112,25 @@ A forced 320-token run at max sequence 384 completed with:
 - identical resident bytes before and after generation
 - successful explicit cleanup
 
+## CLI
+
+The shared Qwen CLI accepts the AWQ checkpoint directly:
+
+```powershell
+python\chat_qwen3.py \
+    --model-dir C:\path\to\Qwen3-14B-AWQ \
+    --max-new-tokens 48 "The capital of France is"
+```
+
+Verified CLI smoke:
+
+- pin: `8.50 s`
+- resident allocation reported: `9.41 GiB`
+- output: `The capital of France is Paris.`
+- prompt processing: `0.463 s/token`
+- decode: `0.458 s/token`
+
 ## Next gates
 
-1. Add CLI examples.
-2. Further optimize packed AWQ matvec throughput.
-3. Benchmark larger context capacities.
+1. Further optimize packed AWQ matvec throughput.
+2. Benchmark larger context capacities.
