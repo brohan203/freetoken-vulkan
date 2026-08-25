@@ -131,11 +131,11 @@ Measured on Radeon RX 6800 XT, 12-token greedy generation of `"The capital of Fr
 | + KV cache | 7.6 s | 2.70 s | 21.2 s | 1.35x |
 | + Resident MoE (approximately 9.5 GB VRAM) | 1.7 s | 1.38 s | 8.6 s | 3.34x |
 | + Resident LM head (+2.2 GB VRAM) | 1.4 s | 1.20 s | 5.0 s | **5.74x** |
-| Fully resident 20b, fused all-expert MoE | CPU prefill | **0.0423 s** | **3.73 s / 64 tokens** | exact token parity |
+| Fully resident 20b, fused pre-MoE + all-expert MoE | CPU prefill | **0.0340 s** | **3.31 s / 64 tokens** | exact token parity |
 | Fully resident 120b, 64-token run | CPU prefill | **0.229 s** | **15.84 s** | exact token parity |
 
 Long stability runs complete without resident-memory growth: 20b generated 320
-tokens at approximately 0.0426 s/token and 120b at approximately 0.272 s/token.
+tokens at approximately 0.0371 s/token and 120b at approximately 0.272 s/token.
 
 ## Architecture
 

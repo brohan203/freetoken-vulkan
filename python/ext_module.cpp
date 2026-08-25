@@ -888,6 +888,19 @@ void rope_kv_attention_resident_vulkan(
     });
 }
 
+void decode_pre_moe_all_resident_vulkan(
+    int64_t x,int64_t input_norm,int64_t normalized,
+    int64_t qw,int64_t qb,int64_t q,int64_t kw,int64_t kb,int64_t k,int64_t vw,int64_t vb,int64_t v,
+    int64_t cos,int64_t sin,int64_t qrot,int64_t krot,int64_t kcache,int64_t vcache,int64_t sinks,int64_t attention_out,
+    int64_t ow,int64_t ob,int64_t projected,int64_t residual,int64_t post_norm_weight,int64_t post_normalized,
+    int64_t router_w,int64_t router_b,int64_t logits,
+    int64_t hidden,int64_t Hq,int64_t Hkv,int64_t head_dim,int64_t experts,int64_t position,int64_t capacity,int64_t sliding_window,double eps,double scale) {
+    auto& ctx=get_ctx();auto& norm=get_pipeline("rmsnorm_f32.comp.spv",3,8);auto& linear=get_pipeline("linear_fp32_resident_f32.comp.spv",4,16);auto& rope=get_pipeline("rope_partial_f32.comp.spv",4,16);auto& append=get_pipeline("kv_cache_append_f32.comp.spv",4,24);auto& attn=get_pipeline("flash_attention_gpt_oss_kv_cache_f32.comp.spv",5,44);auto& add=get_pipeline("vector_add.comp.spv",3,4);
+    struct NPC{uint32_t H;float eps;}npc{(uint32_t)hidden,(float)eps};struct LPC{uint32_t T,N,K,use_bias;};LPC qpc{1u,(uint32_t)(Hq*head_dim),(uint32_t)hidden,1u},kvpc{1u,(uint32_t)(Hkv*head_dim),(uint32_t)hidden,1u},opc{1u,(uint32_t)hidden,(uint32_t)(Hq*head_dim),1u},rpc{1u,(uint32_t)experts,(uint32_t)hidden,1u};struct RPC{uint32_t BH,S,D,rotary_dim;}qrp{(uint32_t)Hq,1u,(uint32_t)head_dim,(uint32_t)head_dim},krp{(uint32_t)Hkv,1u,(uint32_t)head_dim,(uint32_t)head_dim};struct APC{uint32_t B,Hkv,Snew,D,start,capacity;}apc{1u,(uint32_t)Hkv,1u,(uint32_t)head_dim,(uint32_t)position,(uint32_t)capacity};struct ATPC{uint32_t S_q,S_kv,D,H_q,H_kv,H_q_per_kv,past_len,sliding_window,use_sinks,capacity;float scale;}atpc{1u,(uint32_t)(position+1),(uint32_t)head_dim,(uint32_t)Hq,(uint32_t)Hkv,(uint32_t)(Hq/Hkv),(uint32_t)position,(uint32_t)sliding_window,1u,(uint32_t)capacity,(float)scale};struct ADPC{uint32_t n;}adpc{(uint32_t)hidden};
+    auto lin=[&](int64_t w,int64_t b,int64_t in,int64_t out){return make_descriptor_set(linear,{resident_buf(w),resident_buf(b),resident_buf(in),resident_buf(out)});};VkDescriptorSet ns=make_descriptor_set(norm,{resident_buf(x),resident_buf(input_norm),resident_buf(normalized)}),qs=lin(qw,qb,normalized,q),ks=lin(kw,kb,normalized,k),vs=lin(vw,vb,normalized,v),qrs=make_descriptor_set(rope,{resident_buf(q),resident_buf(cos),resident_buf(sin),resident_buf(qrot)}),krs=make_descriptor_set(rope,{resident_buf(k),resident_buf(cos),resident_buf(sin),resident_buf(krot)}),aps=make_descriptor_set(append,{resident_buf(krot),resident_buf(v),resident_buf(kcache),resident_buf(vcache)}),ats=make_descriptor_set(attn,{resident_buf(qrot),resident_buf(kcache),resident_buf(vcache),resident_buf(sinks),resident_buf(attention_out)}),os=lin(ow,ob,attention_out,projected),ads=make_descriptor_set(add,{resident_buf(projected),resident_buf(x),resident_buf(residual)}),pns=make_descriptor_set(norm,{resident_buf(residual),resident_buf(post_norm_weight),resident_buf(post_normalized)}),rs=lin(router_w,router_b,post_normalized,logits);
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){auto bar=[&](){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);};auto bind=[&](KernelPipeline& p,VkDescriptorSet set,const void* pc,uint32_t pcs,uint32_t gx,uint32_t gy){vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,p.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,p.pipeline_layout,0,1,&set,0,nullptr);vkCmdPushConstants(cmd,p.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,pcs,pc);vkCmdDispatch(cmd,gx,gy,1);};bind(norm,ns,&npc,8,1,1);bar();bind(linear,qs,&qpc,16,qpc.N,1);bind(linear,ks,&kvpc,16,kvpc.N,1);bind(linear,vs,&kvpc,16,kvpc.N,1);bar();bind(rope,qrs,&qrp,16,1,(uint32_t)Hq);bind(rope,krs,&krp,16,1,(uint32_t)Hkv);bar();bind(append,aps,&apc,24,(uint32_t)((Hkv*head_dim+255)/256),1);bar();bind(attn,ats,&atpc,44,1,(uint32_t)Hq);bar();bind(linear,os,&opc,16,opc.N,1);bar();bind(add,ads,&adpc,4,(uint32_t)((hidden+255)/256),1);bar();bind(norm,pns,&npc,8,1,1);bar();bind(linear,rs,&rpc,16,rpc.N,1);});
+}
+
 void oproj_router_resident_vulkan(
     int64_t attention_handle, int64_t o_weight_handle,
     int64_t o_bias_handle, int64_t projected_handle,
@@ -1647,6 +1660,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("resident_bytes_total", &resident_bytes_total_vulkan,
           "Total bytes currently held in resident VRAM buffers across all "
           "outstanding handles.");
+    m.def("decode_pre_moe_all_resident",
+          &decode_pre_moe_all_resident_vulkan,
+          "Fused all-resident decode segment through router logits.",
+          py::arg("x"), py::arg("input_norm"), py::arg("normalized"),
+          py::arg("qw"), py::arg("qb"), py::arg("q"),
+          py::arg("kw"), py::arg("kb"), py::arg("k"),
+          py::arg("vw"), py::arg("vb"), py::arg("v"),
+          py::arg("cos"), py::arg("sin"), py::arg("qrot"),
+          py::arg("krot"), py::arg("kcache"), py::arg("vcache"),
+          py::arg("sinks"), py::arg("attention_out"),
+          py::arg("ow"), py::arg("ob"), py::arg("projected"),
+          py::arg("residual"), py::arg("post_norm_weight"),
+          py::arg("post_normalized"), py::arg("router_w"),
+          py::arg("router_b"), py::arg("logits"),
+          py::arg("hidden"), py::arg("Hq"), py::arg("Hkv"),
+          py::arg("head_dim"), py::arg("experts"),
+          py::arg("position"), py::arg("capacity"),
+          py::arg("sliding_window"), py::arg("eps"),
+          py::arg("scale"));
     m.def("topk_moe_residual_resident",
           &topk_moe_residual_resident_vulkan,
           "Fused top-K, all-resident MoE, and final residual.",
