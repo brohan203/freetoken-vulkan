@@ -70,10 +70,39 @@ Verified result for input shape `[1, 3, 2560]`:
 - all outputs finite
 - tolerance gate passed
 
+## Full-model status
+
+`Qwen3Model` now stacks all 36 layers while materializing only one FP32 layer
+at a time. On the prompt `The capital of France is`:
+
+- full forward time: `2.91-2.96 s`
+- finite logits shape: `[1, 1, 151936]`
+- top prediction: ` Paris`
+- mean layer time: `54.7 ms`
+- maximum layer time: `137.6 ms`
+- process working set after touching all mapped shards: `7.93 GiB`
+
+### Transformers parity
+
+A full-model comparison against the official Transformers Qwen3 implementation
+using BF16 CPU math produced:
+
+- identical top-10 token IDs in identical order
+- identical top-1 prediction (` Paris`)
+- top-5 overlap: 5/5
+- maximum raw-logit difference: `0.2861`
+- mean raw-logit difference: `0.0706`
+- Transformers forward: `2.30 s`
+- Vulkan-backed milestone forward: `2.96 s`
+
+Raw-logit differences are expected because Transformers accumulates from BF16
+weights while this correctness runtime expands each layer to FP32. Token ranking
+parity is the acceptance criterion for this milestone.
+
 ## Next gates
 
-1. Stack all 36 layers with lazy per-layer loading.
-2. Run a full-model next-token smoke test.
-3. Add KV-cached generation.
-4. Compare output tokens against Transformers.
-5. Pin BF16/FP32 weights resident only after correctness is established.
+1. Add KV-cached generation.
+2. Validate multi-token output against Transformers greedy generation.
+3. Pin BF16/FP32 weights resident only after generation correctness passes.
+4. Replace CPU dense projections with resident Vulkan operations.
+5. Add a Qwen3 CLI after sustained-generation stability is verified.
