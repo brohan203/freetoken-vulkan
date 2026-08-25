@@ -225,20 +225,17 @@ def resident_decode_layer(
         cfg.num_experts,
         cfg.rms_norm_eps,
     )
-    ext.topk_resident(
-        workspace.router_logits.handle,
-        workspace.router_indices,
-        workspace.router_weights.handle,
-        1,
-    )
     if resident_moe is not None:
         handles = resident_moe.for_layer(layer_idx)
-        ext.moe_mlp_gpt_oss_twostage_io(
-            workspace.post_norm.handle,
+        ext.topk_moe_residual_resident(
+            workspace.router_logits.handle,
             workspace.router_indices,
             workspace.router_weights.handle,
+            workspace.post_norm.handle,
             workspace.moe_hidden.handle,
             workspace.moe_output.handle,
+            workspace.residual.handle,
+            output.handle,
             handles.h_gu_blocks,
             handles.h_gu_scales,
             handles.h_gu_bias,
@@ -248,13 +245,17 @@ def resident_decode_layer(
             handles.E,
             handles.D,
             handles.Dff,
-            1,
-            cfg.num_experts_per_tok,
         )
         global_ids = None
     else:
         if expert_cache is None:
             raise RuntimeError("resident decode needs a resident expert source")
+        ext.topk_resident(
+            workspace.router_logits.handle,
+            workspace.router_indices,
+            workspace.router_weights.handle,
+            1,
+        )
         global_ids = ext.download_resident_i32(
             workspace.router_indices, [1, cfg.num_experts_per_tok]
         ).long()
@@ -269,12 +270,12 @@ def resident_decode_layer(
             workspace.moe_output.handle,
             1,
         )
-    ext.add_resident(
-        workspace.residual.handle,
-        workspace.moe_output.handle,
-        output.handle,
-        hidden,
-    )
+        ext.add_resident(
+            workspace.residual.handle,
+            workspace.moe_output.handle,
+            output.handle,
+            hidden,
+        )
     return next_hidden, global_ids
 
 

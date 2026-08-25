@@ -1390,6 +1390,19 @@ void moe_mlp_gpt_oss_twostage_io_vulkan(
     });
 }
 
+void topk_moe_residual_resident_vulkan(
+    int64_t logits_handle, int64_t indices_handle, int64_t weights_handle,
+    int64_t x_handle, int64_t hidden_handle, int64_t moe_output_handle,
+    int64_t residual_handle, int64_t final_output_handle,
+    int64_t h_gu_blocks, int64_t h_gu_scales, int64_t h_gu_bias,
+    int64_t h_d_blocks, int64_t h_d_scales, int64_t h_d_bias,
+    int64_t E, int64_t D, int64_t Dff) {
+    auto& ctx=get_ctx();auto& topk=get_pipeline("topk_softmax_128_f32.comp.spv",3,4);auto& s1=get_pipeline("moe_mlp_mxfp4_gpt_oss_stage1_f32.comp.spv",6,20);auto& s2=get_pipeline("moe_mlp_mxfp4_gpt_oss_stage2_f32.comp.spv",7,20);auto& add=get_pipeline("vector_add.comp.spv",3,4);
+    VkDescriptorSet dt=make_descriptor_set(topk,{resident_buf(logits_handle),resident_buf(indices_handle),resident_buf(weights_handle)});VkDescriptorSet d1=make_descriptor_set(s1,{resident_buf(h_gu_blocks),resident_buf(h_gu_scales),resident_buf(h_gu_bias),resident_buf(x_handle),resident_buf(indices_handle),resident_buf(hidden_handle)});VkDescriptorSet d2=make_descriptor_set(s2,{resident_buf(h_d_blocks),resident_buf(h_d_scales),resident_buf(h_d_bias),resident_buf(hidden_handle),resident_buf(indices_handle),resident_buf(weights_handle),resident_buf(moe_output_handle)});VkDescriptorSet da=make_descriptor_set(add,{resident_buf(residual_handle),resident_buf(moe_output_handle),resident_buf(final_output_handle)});
+    struct TPC{uint32_t rows;}tpc{1u};struct PC{uint32_t T,D,Dff,E,K;}pc{1u,(uint32_t)D,(uint32_t)Dff,(uint32_t)E,4u};struct APC{uint32_t n;}apc{(uint32_t)D};
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){auto barrier=[&](){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);};vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,topk.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,topk.pipeline_layout,0,1,&dt,0,nullptr);vkCmdPushConstants(cmd,topk.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&tpc);vkCmdDispatch(cmd,1,1,1);barrier();vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s1.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s1.pipeline_layout,0,1,&d1,0,nullptr);vkCmdPushConstants(cmd,s1.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,20,&pc);vkCmdDispatch(cmd,(uint32_t)(4*((Dff+63)/64)),1,1);barrier();vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s2.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s2.pipeline_layout,0,1,&d2,0,nullptr);vkCmdPushConstants(cmd,s2.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,20,&pc);vkCmdDispatch(cmd,(uint32_t)((D+31)/32),1,1);barrier();vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,add.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,add.pipeline_layout,0,1,&da,0,nullptr);vkCmdPushConstants(cmd,add.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&apc);vkCmdDispatch(cmd,(uint32_t)((D+255)/256),1,1);});
+}
+
 torch::Tensor moe_mlp_gpt_oss_twostage_vulkan(
     torch::Tensor x, torch::Tensor indices, torch::Tensor weights,
     int64_t h_gu_blocks, int64_t h_gu_scales, int64_t h_gu_bias,
@@ -1634,6 +1647,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("resident_bytes_total", &resident_bytes_total_vulkan,
           "Total bytes currently held in resident VRAM buffers across all "
           "outstanding handles.");
+    m.def("topk_moe_residual_resident",
+          &topk_moe_residual_resident_vulkan,
+          "Fused top-K, all-resident MoE, and final residual.",
+          py::arg("logits_handle"), py::arg("indices_handle"),
+          py::arg("weights_handle"), py::arg("x_handle"),
+          py::arg("hidden_handle"), py::arg("moe_output_handle"),
+          py::arg("residual_handle"), py::arg("final_output_handle"),
+          py::arg("h_gu_blocks"), py::arg("h_gu_scales"),
+          py::arg("h_gu_bias"), py::arg("h_d_blocks"),
+          py::arg("h_d_scales"), py::arg("h_d_bias"),
+          py::arg("E"), py::arg("D"), py::arg("Dff"));
     m.def("moe_mlp_gpt_oss_twostage_io",
           &moe_mlp_gpt_oss_twostage_io_vulkan,
           "Two-stage MoE with resident activation and control I/O.",

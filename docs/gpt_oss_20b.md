@@ -101,10 +101,10 @@ The generic `python/chat_gpt_oss.py` supports a fully resident 20b path:
 - 64-token output exactly matches the legacy path;
 - canonical global expert IDs feed the pinned 32-expert tables directly, with
   no CPU cache policy or ID remapping;
-- 64-token runtime improved from `40.50 s` legacy to `4.02 s` resident in the
-  final all-expert validation;
-- resident decode averaged `0.0456 s/token` (about 21.9 tokens/second);
-- a 320-token stress averaged `0.0467 s/token` with resident bytes unchanged at
+- 64-token runtime improved from `40.79 s` legacy to `3.73 s` resident after
+  fusing top-K, canonical all-expert MoE, and final residual;
+- resident decode averaged `0.0423 s/token` (about 23.6 tokens/second);
+- a 320-token stress averaged `0.0426 s/token` with resident bytes unchanged at
   `15,053,650,176` and no OOM.
 
 ## Historical order of operations
