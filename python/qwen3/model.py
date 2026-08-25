@@ -52,10 +52,20 @@ class Qwen3Model:
         from .resident import ResidentQwen3Weights
 
         resident = ResidentQwen3Weights(self.ext)
-        sample = self.tensors.get("model.layers.0.self_attn.q_proj.weight")
-        fp8 = sample.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}
+        sample_name = "model.layers.0.self_attn.q_proj.weight"
+        awq = not self.tensors.contains(sample_name)
+        sample = None if awq else self.tensors.get(sample_name)
+        fp8 = sample is not None and sample.dtype in {
+            torch.float8_e4m3fn, torch.float8_e4m3fnuz
+        }
         if self.config.tie_word_embeddings:
             resident.pin_global(self.embed_tokens, self.final_norm)
+        elif awq:
+            resident.pin_global(
+                self.embed_tokens,
+                self.final_norm,
+                self.tensors.get("lm_head.weight"),
+            )
         elif fp8:
             raw_head = self.tensors.get("lm_head.weight")
             head_scale = None
@@ -68,7 +78,9 @@ class Qwen3Model:
             resident.pin_global(self.embed_tokens, self.final_norm, self.lm_head)
         started = time.time()
         for layer_idx in range(self.config.num_hidden_layers):
-            if fp8:
+            if awq:
+                resident.append_awq(self.tensors, layer_idx)
+            elif fp8:
                 resident.append_fp8(self.tensors, layer_idx)
             else:
                 weights = load_qwen3_layer(self.tensors, layer_idx)

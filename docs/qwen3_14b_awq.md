@@ -62,9 +62,41 @@ One full real Qwen3-14B-AWQ layer compared with an independent PyTorch reference
 - mean absolute error: `5.223e-8`
 - finite output
 
+## Fully resident model
+
+The resident manager stores every packed qweight/qzeros/scales triplet without
+dequantizing it. Norms, embeddings, and LM head remain BF16/FP32 as in the
+checkpoint.
+
+Full-model gate:
+
+- all 40 layers resident
+- resident allocation: `9,999,452,832` bytes (about 9.31 GiB)
+- pin time: `6.20 s`
+- one full resident token: `0.926 s`
+- top-10 IDs exactly match the lazy dequantized model
+- maximum logit difference: `1.097e-5`
+- mean logit difference: `2.194e-6`
+- explicit cleanup returns resident bytes exactly to zero
+
+The lazy one-token reference took `702.9 s` because all 40 layers had to be
+unpacked into FP32 sequentially.
+
+Eight-token resident generation:
+
+```text
+The capital of France is Paris. What is the capital of the
+```
+
+- prompt processing: `0.920 s/token`
+- decode: `0.918 s/token`
+- steady resident bytes unchanged at `9,999,452,832`
+
+This initial path is intentionally unfused. Correctness and resident fit are
+established before AWQ layer command fusion.
+
 ## Next gates
 
-1. Add AWQ matrix handles to the resident manager.
-2. Pin all 40 layers resident.
-4. Run full-model and generation parity.
-5. Add long-context stability and CLI examples.
+1. Fuse AWQ dense-layer submissions.
+2. Run a 320-token resident stability test.
+3. Add CLI examples.

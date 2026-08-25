@@ -30,6 +30,13 @@ class ResidentQwen3LayerWeights:
     gate_scale: int = 0
     up_scale: int = 0
     down_scale: int = 0
+    q_zero: int = 0
+    k_zero: int = 0
+    v_zero: int = 0
+    o_zero: int = 0
+    gate_zero: int = 0
+    up_zero: int = 0
+    down_zero: int = 0
 
     def handles(self) -> list[int]:
         return [handle for handle in [
@@ -38,6 +45,8 @@ class ResidentQwen3LayerWeights:
             self.gate_weight, self.up_weight, self.down_weight,
             self.q_scale, self.k_scale, self.v_scale, self.o_scale,
             self.gate_scale, self.up_scale, self.down_scale,
+            self.q_zero, self.k_zero, self.v_zero, self.o_zero,
+            self.gate_zero, self.up_zero, self.down_zero,
         ] if handle]
 
 
@@ -125,6 +134,60 @@ class ResidentQwen3Weights:
             weight_format="fp8",
             q_scale=qs, k_scale=ks, v_scale=vs, o_scale=os,
             gate_scale=gates, up_scale=ups, down_scale=downs,
+        )
+        self.layers.append(layer)
+        return layer
+
+    def append_awq(self, tensors, layer_idx: int) -> ResidentQwen3LayerWeights:
+        prefix = f"model.layers.{layer_idx}"
+        upload = self.ext.upload_resident
+
+        def norm(suffix: str) -> int:
+            tensor = tensors.get(f"{prefix}.{suffix}")
+            return upload(tensor.float().contiguous())
+
+        def matrix(suffix: str) -> tuple[int, int, int]:
+            stem = f"{prefix}.{suffix}".removesuffix(".weight")
+            return (
+                upload(tensors.get(stem + ".qweight").contiguous()),
+                upload(tensors.get(stem + ".qzeros").contiguous()),
+                upload(tensors.get(stem + ".scales").contiguous()),
+            )
+
+        q, qz, qs = matrix("self_attn.q_proj.weight")
+        k, kz, ks = matrix("self_attn.k_proj.weight")
+        v, vz, vs = matrix("self_attn.v_proj.weight")
+        o, oz, os = matrix("self_attn.o_proj.weight")
+        gate, gatez, gates = matrix("mlp.gate_proj.weight")
+        up, upz, ups = matrix("mlp.up_proj.weight")
+        down, downz, downs = matrix("mlp.down_proj.weight")
+        layer = ResidentQwen3LayerWeights(
+            input_norm=norm("input_layernorm.weight"),
+            post_norm=norm("post_attention_layernorm.weight"),
+            q_norm=norm("self_attn.q_norm.weight"),
+            k_norm=norm("self_attn.k_norm.weight"),
+            q_weight=q,
+            k_weight=k,
+            v_weight=v,
+            o_weight=o,
+            gate_weight=gate,
+            up_weight=up,
+            down_weight=down,
+            weight_format="awq",
+            q_scale=qs,
+            k_scale=ks,
+            v_scale=vs,
+            o_scale=os,
+            gate_scale=gates,
+            up_scale=ups,
+            down_scale=downs,
+            q_zero=qz,
+            k_zero=kz,
+            v_zero=vz,
+            o_zero=oz,
+            gate_zero=gatez,
+            up_zero=upz,
+            down_zero=downz,
         )
         self.layers.append(layer)
         return layer
@@ -217,6 +280,83 @@ class ResidentQwen3Workspace:
         self._freed = True
 
 
+def _resident_qwen3_layer_awq(
+    ext,
+    workspace: ResidentQwen3Workspace,
+    weights: ResidentQwen3LayerWeights,
+    layer_idx: int,
+    input_slot: int,
+    position: int,
+) -> int:
+    cfg = workspace.config
+    output_slot = 1 - input_slot
+    x = workspace.hidden[input_slot]
+    out = workspace.hidden[output_slot]
+    d, hd = cfg.hidden_size, cfg.head_dim
+    hq, hkv = cfg.num_attention_heads, cfg.num_key_value_heads
+
+    def linear(source, weight, zero, scale, target, n_size, k_size):
+        ext.linear_awq4_resident_io(
+            source.handle, weight, zero, scale, target.handle,
+            1, n_size, k_size, 128,
+        )
+
+    ext.rmsnorm_resident(
+        x.handle, weights.input_norm, workspace.normalized.handle,
+        1, d, cfg.rms_norm_eps,
+    )
+    linear(workspace.normalized, weights.q_weight, weights.q_zero,
+           weights.q_scale, workspace.q, cfg.query_size, d)
+    linear(workspace.normalized, weights.k_weight, weights.k_zero,
+           weights.k_scale, workspace.k, cfg.kv_size, d)
+    linear(workspace.normalized, weights.v_weight, weights.v_zero,
+           weights.v_scale, workspace.v, cfg.kv_size, d)
+    ext.rmsnorm_resident(
+        workspace.q.handle, weights.q_norm, workspace.q.handle,
+        hq, hd, cfg.rms_norm_eps,
+    )
+    ext.rmsnorm_resident(
+        workspace.k.handle, weights.k_norm, workspace.k.handle,
+        hkv, hd, cfg.rms_norm_eps,
+    )
+    ext.rope_kv_attention_resident(
+        workspace.q.handle, workspace.k.handle, workspace.v.handle,
+        workspace.cos.handle, workspace.sin.handle,
+        workspace.q_rotated.handle, workspace.k_rotated.handle,
+        workspace.k_cache[layer_idx].handle,
+        workspace.v_cache[layer_idx].handle,
+        workspace.sinks.handle, workspace.attention.handle,
+        1, hq, hkv, 1, hd, position, workspace.capacity, 0, False,
+        1.0 / (hd ** 0.5),
+    )
+    linear(workspace.attention, weights.o_weight, weights.o_zero,
+           weights.o_scale, workspace.projected, d, cfg.query_size)
+    ext.add_resident(
+        workspace.projected.handle, x.handle, workspace.residual.handle, d
+    )
+    ext.rmsnorm_resident(
+        workspace.residual.handle, weights.post_norm,
+        workspace.post_normalized.handle, 1, d, cfg.rms_norm_eps,
+    )
+    linear(workspace.post_normalized, weights.gate_weight,
+           weights.gate_zero, weights.gate_scale, workspace.gate,
+           cfg.intermediate_size, d)
+    linear(workspace.post_normalized, weights.up_weight,
+           weights.up_zero, weights.up_scale, workspace.up,
+           cfg.intermediate_size, d)
+    ext.swiglu_resident(
+        workspace.gate.handle, workspace.up.handle,
+        workspace.activated.handle, cfg.intermediate_size,
+    )
+    linear(workspace.activated, weights.down_weight,
+           weights.down_zero, weights.down_scale, workspace.mlp_output,
+           d, cfg.intermediate_size)
+    ext.add_resident(
+        workspace.residual.handle, workspace.mlp_output.handle, out.handle, d
+    )
+    return output_slot
+
+
 def resident_qwen3_layer(
     ext,
     workspace: ResidentQwen3Workspace,
@@ -225,6 +365,10 @@ def resident_qwen3_layer(
     input_slot: int,
     position: int,
 ) -> int:
+    if weights.weight_format == "awq":
+        return _resident_qwen3_layer_awq(
+            ext, workspace, weights, layer_idx, input_slot, position
+        )
     cfg = workspace.config
     output_slot = 1 - input_slot
     ext.qwen3_decode_layer_resident(
