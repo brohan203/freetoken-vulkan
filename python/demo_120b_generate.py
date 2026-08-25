@@ -29,6 +29,9 @@ CACHE_POLICY = os.environ.get("FREETOKEN_CACHE_POLICY", "lfu")
 PIN_LM_HEAD = os.environ.get("FREETOKEN_PIN_LM_HEAD", "1") == "1"
 ENABLE_GPU_CACHE = os.environ.get("FREETOKEN_GPU_CACHE", "1") == "1"
 PREFILL_CHUNK_SIZE = int(os.environ.get("FREETOKEN_PREFILL_CHUNK", "0")) or None
+CPU_THREADS = int(os.environ.get("FREETOKEN_CPU_THREADS", "12"))
+torch.set_num_threads(CPU_THREADS)
+print(f"[120b] PyTorch CPU threads: {CPU_THREADS}", flush=True)
 
 sdk = pathlib.Path(os.environ["VULKAN_SDK"])
 print("[120b] Loading Vulkan extension...", flush=True)

@@ -81,6 +81,7 @@ Representative results:
 | 24-slot GPU expert cache | 5 / 16 | 9.2 s | 3.1 s/token | 48.2 s |
 | 24-slot GPU cache + mmap expert rows | 5 / 16 | 7.8 s | 2.3 s/token | 41.8 s |
 | 24-slot GPU cache + mmap rows + resident LM head | 5 / 16 | 6.9 s | 2.09 s/token | 38.2 s |
+| Previous row + 12 PyTorch CPU threads | 5 / 16 | 6.5 s | 1.65 s/token | 31.2 s |
 | 28-slot GPU cache + mmap expert rows | 5 / 16 | 7.7 s | 2.3 s/token | 41.8 s |
 
 Twenty-four slots are the default because 28 slots consume more VRAM without a
@@ -91,7 +92,10 @@ the Vulkan buffer pool. Together these changes reduce measured host expert
 materialization from approximately 18 seconds to approximately 0.2 seconds in
 the 16-token run. Resident LM head is now enabled by
 default because the faster expert path makes its approximately 7 percent total
-speedup measurable while fitting within the 16 GB budget.
+speedup measurable while fitting within the 16 GB budget. Twelve PyTorch
+intra-op CPU threads are the measured default for the remaining Q/K/V/O/router
+matrix-vector work; 6, 8, and 12 threads were tested end-to-end and 12 produced
+the best total (31.2 seconds for 16 generated tokens).
 
 The default eviction policy is LFU with recency tie-breaking. A 48-token trace
 measured 64.8 percent LFU hits versus 61.7 percent for LRU under the same
@@ -117,6 +121,7 @@ FREETOKEN_CACHE_POLICY
 FREETOKEN_GPU_CACHE
 FREETOKEN_PIN_LM_HEAD
 FREETOKEN_PREFILL_CHUNK
+FREETOKEN_CPU_THREADS
 ```
 
 Recommended defaults:
@@ -127,6 +132,7 @@ FREETOKEN_CACHE_POLICY=lfu
 FREETOKEN_GPU_CACHE=1
 FREETOKEN_PIN_LM_HEAD=1
 FREETOKEN_PREFILL_CHUNK=0
+FREETOKEN_CPU_THREADS=12
 ```
 
 ## Known limits
