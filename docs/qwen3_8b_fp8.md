@@ -70,14 +70,28 @@ The capital of France is Paris. The capital of Italy is Rome
 Performance:
 
 - lazy generation: `81.92 s`
-- resident generation: `1.01 s`
-- prompt processing: `0.0857 s/token`
-- decode: `0.0828 s/token` (about 12.1 tokens/second)
+- fused resident generation: `0.521 s`
+- prompt processing: `0.0446 s/token`
+- decode: `0.0418 s/token` (about 23.9 tokens/second)
 - resident allocation unchanged before/after generation
 - explicit cleanup returns resident bytes exactly to zero
 
+## Fused layer and long stability
+
+The same fused dense-layer operation now handles both native BF16 and
+block-scaled FP8 weights by switching the resident linear pipeline and binding
+FP8 scale grids. Eight-token parity remains exact.
+
+A forced 320-token run at max sequence 384 completed with:
+
+- total runtime: `15.44 s`
+- decode average: `0.0467 s/token`
+- steady resident allocation: `9,552,210,560` bytes
+- identical resident bytes before and after generation
+- successful explicit cleanup
+
 ## Next gates
 
-1. Fuse FP8 dense-layer submissions for higher throughput.
-2. Run a 320-token resident stability test.
-3. Add explicit 8B examples to the Qwen CLI documentation.
+1. Add explicit Qwen3-8B-FP8 CLI examples.
+2. Benchmark larger context capacities.
+3. Add batch-size and continuous-batching support.

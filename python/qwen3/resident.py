@@ -227,45 +227,6 @@ def resident_qwen3_layer(
 ) -> int:
     cfg = workspace.config
     output_slot = 1 - input_slot
-    if weights.weight_format == "fp8":
-        x = workspace.hidden[input_slot]
-        out = workspace.hidden[output_slot]
-        d = cfg.hidden_size
-        hd = cfg.head_dim
-        hq = cfg.num_attention_heads
-        hkv = cfg.num_key_value_heads
-
-        def linear(source, weight, scale, target, output_size, input_size):
-            ext.linear_fp8e4m3_resident_io(
-                source.handle, weight, scale, target.handle,
-                1, output_size, input_size, (input_size + 127) // 128,
-            )
-
-        ext.rmsnorm_resident(x.handle, weights.input_norm, workspace.normalized.handle, 1, d, cfg.rms_norm_eps)
-        linear(workspace.normalized, weights.q_weight, weights.q_scale, workspace.q, cfg.query_size, d)
-        linear(workspace.normalized, weights.k_weight, weights.k_scale, workspace.k, cfg.kv_size, d)
-        linear(workspace.normalized, weights.v_weight, weights.v_scale, workspace.v, cfg.kv_size, d)
-        ext.rmsnorm_resident(workspace.q.handle, weights.q_norm, workspace.q.handle, hq, hd, cfg.rms_norm_eps)
-        ext.rmsnorm_resident(workspace.k.handle, weights.k_norm, workspace.k.handle, hkv, hd, cfg.rms_norm_eps)
-        ext.rope_kv_attention_resident(
-            workspace.q.handle, workspace.k.handle, workspace.v.handle,
-            workspace.cos.handle, workspace.sin.handle,
-            workspace.q_rotated.handle, workspace.k_rotated.handle,
-            workspace.k_cache[layer_idx].handle, workspace.v_cache[layer_idx].handle,
-            workspace.sinks.handle, workspace.attention.handle,
-            1, hq, hkv, 1, hd, position, workspace.capacity, 0, False,
-            1.0 / (hd ** 0.5),
-        )
-        linear(workspace.attention, weights.o_weight, weights.o_scale, workspace.projected, d, cfg.query_size)
-        ext.add_resident(workspace.projected.handle, x.handle, workspace.residual.handle, d)
-        ext.rmsnorm_resident(workspace.residual.handle, weights.post_norm, workspace.post_normalized.handle, 1, d, cfg.rms_norm_eps)
-        linear(workspace.post_normalized, weights.gate_weight, weights.gate_scale, workspace.gate, cfg.intermediate_size, d)
-        linear(workspace.post_normalized, weights.up_weight, weights.up_scale, workspace.up, cfg.intermediate_size, d)
-        ext.swiglu_resident(workspace.gate.handle, workspace.up.handle, workspace.activated.handle, cfg.intermediate_size)
-        linear(workspace.activated, weights.down_weight, weights.down_scale, workspace.mlp_output, d, cfg.intermediate_size)
-        ext.add_resident(workspace.residual.handle, workspace.mlp_output.handle, out.handle, d)
-        return output_slot
-
     ext.qwen3_decode_layer_resident(
         workspace.hidden[input_slot].handle,
         weights.input_norm,
@@ -299,6 +260,14 @@ def resident_qwen3_layer(
         weights.down_weight,
         workspace.mlp_output.handle,
         workspace.hidden[output_slot].handle,
+        weights.q_scale,
+        weights.k_scale,
+        weights.v_scale,
+        weights.o_scale,
+        weights.gate_scale,
+        weights.up_scale,
+        weights.down_scale,
+        weights.weight_format == "fp8",
         cfg.hidden_size,
         cfg.intermediate_size,
         cfg.num_attention_heads,
