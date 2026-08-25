@@ -900,14 +900,6 @@ void rope_kv_attention_resident_vulkan(
     });
 }
 
-void qwen3_decode_layer_awq_resident_vulkan(
- int64_t x,int64_t input_norm,int64_t normalized,int64_t qw,int64_t qz,int64_t qs,int64_t q,int64_t kw,int64_t kz,int64_t ks,int64_t k,int64_t vw,int64_t vz,int64_t vs,int64_t v,int64_t qnorm,int64_t knorm,int64_t cos,int64_t sin,int64_t qrot,int64_t krot,int64_t kcache,int64_t vcache,int64_t sinks,int64_t attn,int64_t ow,int64_t oz,int64_t os,int64_t projected,int64_t residual,int64_t postnorm,int64_t post,int64_t gatew,int64_t gatez,int64_t gates,int64_t gate,int64_t upw,int64_t upz,int64_t ups,int64_t up,int64_t activated,int64_t downw,int64_t downz,int64_t downs,int64_t mlp,int64_t out,int64_t D,int64_t Dff,int64_t Hq,int64_t Hkv,int64_t Hd,int64_t position,int64_t capacity,double eps,double scale){
- auto&ctx=get_ctx();auto&norm=get_pipeline("rmsnorm_f32.comp.spv",3,8);auto&lin=get_pipeline("linear_awq4_resident_f32.comp.spv",5,16);auto&rope=get_pipeline("rope_partial_f32.comp.spv",4,16);auto&append=get_pipeline("kv_cache_append_f32.comp.spv",4,24);auto&attention=get_pipeline("flash_attention_gpt_oss_kv_cache_f32.comp.spv",5,44);auto&add=get_pipeline("vector_add.comp.spv",3,4);auto&glu=get_pipeline("swiglu_f32.comp.spv",3,4);
- struct NPC{uint32_t H;float eps;};NPC nd{(uint32_t)D,(float)eps},nh{(uint32_t)Hd,(float)eps};struct LPC{uint32_t T,N,K,group_size;};LPC qpc{1u,(uint32_t)(Hq*Hd),(uint32_t)D,128u},kpc{1u,(uint32_t)(Hkv*Hd),(uint32_t)D,128u},dpc{1u,(uint32_t)Dff,(uint32_t)D,128u},opc{1u,(uint32_t)D,(uint32_t)(Hq*Hd),128u},downpc{1u,(uint32_t)D,(uint32_t)Dff,128u};struct RPC{uint32_t BH,S,D,rotary_dim;}qrp{(uint32_t)Hq,1u,(uint32_t)Hd,(uint32_t)Hd},krp{(uint32_t)Hkv,1u,(uint32_t)Hd,(uint32_t)Hd};struct KPC{uint32_t B,Hkv,Snew,D,start,capacity;}cpc{1u,(uint32_t)Hkv,1u,(uint32_t)Hd,(uint32_t)position,(uint32_t)capacity};struct APC{uint32_t S_q,S_kv,D,H_q,H_kv,H_q_per_kv,past_len,sliding_window,use_sinks,capacity;float scale;}apc{1u,(uint32_t)(position+1),(uint32_t)Hd,(uint32_t)Hq,(uint32_t)Hkv,(uint32_t)(Hq/Hkv),(uint32_t)position,0u,0u,(uint32_t)capacity,(float)scale};struct VPC{uint32_t n;}vd{(uint32_t)D},vf{(uint32_t)Dff};
- auto L=[&](int64_t w,int64_t z,int64_t s,int64_t in,int64_t o){return make_descriptor_set(lin,{resident_buf(w),resident_buf(z),resident_buf(s),resident_buf(in),resident_buf(o)});};auto N=[&](int64_t a,int64_t w,int64_t o){return make_descriptor_set(norm,{resident_buf(a),resident_buf(w),resident_buf(o)});};auto A=[&](int64_t a,int64_t b,int64_t o){return make_descriptor_set(add,{resident_buf(a),resident_buf(b),resident_buf(o)});};VkDescriptorSet n0=N(x,input_norm,normalized),lq=L(qw,qz,qs,normalized,q),lk=L(kw,kz,ks,normalized,k),lv=L(vw,vz,vs,normalized,v),nq=N(q,qnorm,q),nk=N(k,knorm,k),rq=make_descriptor_set(rope,{resident_buf(q),resident_buf(cos),resident_buf(sin),resident_buf(qrot)}),rk=make_descriptor_set(rope,{resident_buf(k),resident_buf(cos),resident_buf(sin),resident_buf(krot)}),ca=make_descriptor_set(append,{resident_buf(krot),resident_buf(v),resident_buf(kcache),resident_buf(vcache)}),at=make_descriptor_set(attention,{resident_buf(qrot),resident_buf(kcache),resident_buf(vcache),resident_buf(sinks),resident_buf(attn)}),lo=L(ow,oz,os,attn,projected),a0=A(projected,x,residual),n1=N(residual,postnorm,post),lg=L(gatew,gatez,gates,post,gate),lu=L(upw,upz,ups,post,up),sg=make_descriptor_set(glu,{resident_buf(gate),resident_buf(up),resident_buf(activated)}),ld=L(downw,downz,downs,activated,mlp),a1=A(residual,mlp,out);
- vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){auto bar=[&](){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);};auto run=[&](KernelPipeline&p,VkDescriptorSet ds,const void*pc,uint32_t pcs,uint32_t gx,uint32_t gy=1){vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,p.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,p.pipeline_layout,0,1,&ds,0,nullptr);vkCmdPushConstants(cmd,p.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,pcs,pc);vkCmdDispatch(cmd,gx,gy,1);};run(norm,n0,&nd,8,1);bar();run(lin,lq,&qpc,16,(qpc.N+127)/128);run(lin,lk,&kpc,16,(kpc.N+127)/128);run(lin,lv,&kpc,16,(kpc.N+127)/128);bar();run(norm,nq,&nh,8,Hq);run(norm,nk,&nh,8,Hkv);bar();run(rope,rq,&qrp,16,1,Hq);run(rope,rk,&krp,16,1,Hkv);bar();run(append,ca,&cpc,24,(Hkv*Hd+255)/256);bar();run(attention,at,&apc,44,1,Hq);bar();run(lin,lo,&opc,16,(opc.N+127)/128);bar();run(add,a0,&vd,4,(D+255)/256);bar();run(norm,n1,&nd,8,1);bar();run(lin,lg,&dpc,16,(dpc.N+127)/128);run(lin,lu,&dpc,16,(dpc.N+127)/128);bar();run(glu,sg,&vf,4,(Dff+255)/256);bar();run(lin,ld,&downpc,16,(downpc.N+127)/128);bar();run(add,a1,&vd,4,(D+255)/256);});
-}
-
 void qwen3_decode_layer_resident_vulkan(
  int64_t x,int64_t input_norm,int64_t normalized,int64_t qw,int64_t q,int64_t kw,int64_t k,int64_t vw,int64_t v,int64_t qnorm,int64_t knorm,int64_t cos,int64_t sin,int64_t qrot,int64_t krot,int64_t kcache,int64_t vcache,int64_t sinks,int64_t attn,int64_t ow,int64_t projected,int64_t residual,int64_t postnorm,int64_t post,int64_t gatew,int64_t gate,int64_t upw,int64_t up,int64_t activated,int64_t downw,int64_t mlp,int64_t out,int64_t qs,int64_t ks,int64_t vs,int64_t os,int64_t gates,int64_t ups,int64_t downs,bool fp8,int64_t D,int64_t Dff,int64_t Hq,int64_t Hkv,int64_t Hd,int64_t position,int64_t capacity,double eps,double scale){
  auto&ctx=get_ctx();auto&norm=get_pipeline("rmsnorm_f32.comp.spv",3,8);auto&lin=get_pipeline(fp8?"linear_fp8e4m3_resident_f32.comp.spv":"linear_bf16_resident_f32.comp.spv",4,16);auto&rope=get_pipeline("rope_partial_f32.comp.spv",4,16);auto&append=get_pipeline("kv_cache_append_f32.comp.spv",4,24);auto&attention=get_pipeline("flash_attention_gpt_oss_kv_cache_f32.comp.spv",5,44);auto&add=get_pipeline("vector_add.comp.spv",3,4);auto&glu=get_pipeline("swiglu_f32.comp.spv",3,4);
@@ -959,6 +951,18 @@ void oproj_router_resident_vulkan(
         vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,norm.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,norm.pipeline_layout,0,1,&norm_set,0,nullptr);vkCmdPushConstants(cmd,norm.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,&norm_pc);vkCmdDispatch(cmd,(uint32_t)rows,1,1);barrier(cmd);
         vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline_layout,0,1,&router_set,0,nullptr);vkCmdPushConstants(cmd,linear.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,&router_pc);vkCmdDispatch(cmd,(uint32_t)experts,(uint32_t)rows,1);
     });
+}
+
+void linear_awq4_twostage_resident_io_vulkan(
+    int64_t x_handle, int64_t h_qweight, int64_t h_qzeros,
+    int64_t h_scales, int64_t partials_handle, int64_t y_handle,
+    int64_t N, int64_t K, int64_t group_size) {
+    const uint32_t chunk_k=1024;
+    const uint32_t chunks=(uint32_t)((K+chunk_k-1)/chunk_k);
+    auto&ctx=get_ctx();auto&s1=get_pipeline("linear_awq4_stage1_f32.comp.spv",5,16);auto&s2=get_pipeline("linear_awq4_stage2_f32.comp.spv",2,8);
+    struct P1{uint32_t N,K,group_size,chunk_k;}p1{(uint32_t)N,(uint32_t)K,(uint32_t)group_size,chunk_k};struct P2{uint32_t N,chunks;}p2{(uint32_t)N,chunks};
+    VkDescriptorSet d1=make_descriptor_set(s1,{resident_buf(h_qweight),resident_buf(h_qzeros),resident_buf(h_scales),resident_buf(x_handle),resident_buf(partials_handle)});VkDescriptorSet d2=make_descriptor_set(s2,{resident_buf(partials_handle),resident_buf(y_handle)});
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s1.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s1.pipeline_layout,0,1,&d1,0,nullptr);vkCmdPushConstants(cmd,s1.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,&p1);vkCmdDispatch(cmd,(uint32_t)((N+127)/128),chunks,1);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s2.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,s2.pipeline_layout,0,1,&d2,0,nullptr);vkCmdPushConstants(cmd,s2.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,&p2);vkCmdDispatch(cmd,(uint32_t)((N+127)/128),1,1);});
 }
 
 void linear_awq4_resident_io_vulkan(
@@ -1718,9 +1722,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("resident_bytes_total", &resident_bytes_total_vulkan,
           "Total bytes currently held in resident VRAM buffers across all "
           "outstanding handles.");
-    m.def("qwen3_decode_layer_awq_resident",
-          &qwen3_decode_layer_awq_resident_vulkan,
-          "Fused fully resident AWQ Qwen single-token layer.");
     m.def("qwen3_decode_layer_resident",
           &qwen3_decode_layer_resident_vulkan,
           "Fused fully resident Qwen3 single-token layer.");
@@ -1812,6 +1813,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("logits_handle"), py::arg("rows"), py::arg("hidden"),
           py::arg("attention_size"), py::arg("experts"),
           py::arg("eps") = 1e-5);
+    m.def("linear_awq4_twostage_resident_io",
+          &linear_awq4_twostage_resident_io_vulkan,
+          "Two-stage FP32 linear with resident packed AWQ 4-bit weights.",
+          py::arg("x_handle"), py::arg("qweight_handle"),
+          py::arg("qzeros_handle"), py::arg("scales_handle"),
+          py::arg("partials_handle"), py::arg("y_handle"),
+          py::arg("N"), py::arg("K"), py::arg("group_size"));
     m.def("linear_awq4_resident_io", &linear_awq4_resident_io_vulkan,
           "FP32 linear output with resident packed AWQ 4-bit weights.",
           py::arg("x_handle"), py::arg("qweight_handle"),

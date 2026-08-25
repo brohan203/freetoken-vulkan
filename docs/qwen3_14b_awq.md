@@ -98,17 +98,27 @@ The AWQ layer is now one command submission. The AWQ matvec maps each 128-lane
 workgroup to 128 adjacent output columns, matching the checkpoint's
 `[input, output/8]` layout and coalescing packed-weight/scale reads.
 
+The AWQ matvec now uses two stages. Stage 1 splits K into 1,024-element chunks
+and writes partial sums; stage 2 reduces chunks per output. This increases GPU
+parallelism substantially for the large down projection.
+
+Standalone measurements:
+
+- Q projection: `10.7x` faster than the single-stage tiled shader
+- down projection: `12.3x` faster
+- maximum two-stage difference: `5.29e-7`
+
 Eight-token generation remains identical while performance improves:
 
-- prompt processing: `0.460 s/token`
-- decode: `0.455 s/token`
-- about 2x faster than the first resident path (`0.918 s/token`)
+- prompt processing: `0.147 s/token`
+- decode: `0.142 s/token` (about 7.05 tokens/second)
+- about 6.5x faster than the first resident path (`0.918 s/token`)
 
 A forced 320-token run at max sequence 384 completed with:
 
-- total runtime: `152.10 s`
-- decode average: `0.4646 s/token`
-- steady resident allocation: `10,104,310,432` bytes
+- total runtime: `48.35 s`
+- decode average: `0.1473 s/token`
+- steady resident allocation: `10,104,658,592` bytes
 - identical resident bytes before and after generation
 - successful explicit cleanup
 

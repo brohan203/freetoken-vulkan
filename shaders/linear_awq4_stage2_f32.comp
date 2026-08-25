@@ -1,0 +1,6 @@
+#version 450
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer PBuf { float partials[]; };
+layout(std430,binding=1) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P { uint N;uint chunks; } p;
+void main(){uint n=gl_GlobalInvocationID.x;if(n>=p.N)return;float acc=0.0;for(uint chunk=0u;chunk<p.chunks;++chunk)acc+=partials[chunk*p.N+n];Y[n]=acc;}

@@ -10,7 +10,7 @@ Verified end-to-end on one Radeon RX 6800 XT (16 GB VRAM, RDNA2, Navi 21):
 - `gpt-oss-120b`: approximately 0.229 s/token resident decode
 - `Qwen3-4B`: approximately 0.026 s/token resident decode
 - `Qwen3-8B-FP8`: approximately 0.042 s/token resident decode
-- `Qwen3-14B-AWQ`: approximately 0.455 s/token resident decode
+- `Qwen3-14B-AWQ`: approximately 0.142 s/token resident decode
 
 The backend uses GLSL compute shaders compiled to SPIR-V and a minimal C++
 Vulkan runtime. It is inspired by the NVIDIA/Triton-oriented

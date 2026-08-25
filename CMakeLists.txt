@@ -79,6 +79,8 @@ add_shader(attention shaders/linear_fp16_resident_f32.comp)
 add_shader(attention shaders/linear_bf16_resident_f32.comp)
 add_shader(attention shaders/linear_fp8e4m3_resident_f32.comp)
 add_shader(attention shaders/linear_awq4_resident_f32.comp)
+add_shader(attention shaders/linear_awq4_stage1_f32.comp)
+add_shader(attention shaders/linear_awq4_stage2_f32.comp)
 
 # ---- moe_router: phase 6 executable ----
 add_executable(moe_router src/moe_router.cpp)
