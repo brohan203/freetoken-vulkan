@@ -109,8 +109,18 @@ Correctness and performance:
 - equivalent CPU chain at 12 threads: `1.777 ms`;
 - local speedup approximately 6.8x.
 
-The next Phase 2 step is resident O projection + residual, post-attention
-RMSNorm, and router projection/top-K before full layer batching.
+Resident O projection + residual, post-attention RMSNorm, and router projection
+are now validated on real 120b weights:
+
+- O projection max error `2.86e-5`;
+- residual max error `2.86e-5`;
+- post-attention RMSNorm max error `7.15e-7`;
+- router logits max error `1.14e-5`;
+- router top-4 IDs exactly identical;
+- fused resident chain `0.283 ms` vs CPU `1.308 ms` (approximately 4.6x).
+
+The remaining Phase 2 step is a hybrid resident decode layer that measures the
+Q/K/V attention boundary and router/top-K transfer before full Phase 3 batching.
 
 ## Phase 3: one submit per layer
 

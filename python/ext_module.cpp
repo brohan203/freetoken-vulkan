@@ -797,6 +797,38 @@ void rmsnorm_qkv_resident_vulkan(
     });
 }
 
+void oproj_router_resident_vulkan(
+    int64_t attention_handle, int64_t o_weight_handle,
+    int64_t o_bias_handle, int64_t projected_handle,
+    int64_t residual_handle, int64_t residual_out_handle,
+    int64_t norm_weight_handle, int64_t normalized_handle,
+    int64_t router_weight_handle, int64_t router_bias_handle,
+    int64_t logits_handle, int64_t rows, int64_t hidden,
+    int64_t attention_size, int64_t experts, double eps) {
+    auto& ctx = get_ctx();
+    auto& linear = get_pipeline("linear_fp32_resident_f32.comp.spv",4,16);
+    auto& add = get_pipeline("vector_add.comp.spv",3,4);
+    auto& norm = get_pipeline("rmsnorm_f32.comp.spv",3,8);
+    struct LinearPC{uint32_t T,N,K,use_bias;};
+    LinearPC o_pc{(uint32_t)rows,(uint32_t)hidden,
+                  (uint32_t)attention_size,1u};
+    LinearPC router_pc{(uint32_t)rows,(uint32_t)experts,(uint32_t)hidden,1u};
+    struct AddPC{uint32_t n;} add_pc{(uint32_t)(rows*hidden)};
+    struct NormPC{uint32_t H;float eps;} norm_pc{(uint32_t)hidden,(float)eps};
+    auto linear_set=[&](int64_t w,int64_t b,int64_t x,int64_t y){return make_descriptor_set(linear,{resident_buf(w),resident_buf(b),resident_buf(x),resident_buf(y)});};
+    VkDescriptorSet o_set=linear_set(o_weight_handle,o_bias_handle,attention_handle,projected_handle);
+    VkDescriptorSet add_set=make_descriptor_set(add,{resident_buf(projected_handle),resident_buf(residual_handle),resident_buf(residual_out_handle)});
+    VkDescriptorSet norm_set=make_descriptor_set(norm,{resident_buf(residual_out_handle),resident_buf(norm_weight_handle),resident_buf(normalized_handle)});
+    VkDescriptorSet router_set=linear_set(router_weight_handle,router_bias_handle,normalized_handle,logits_handle);
+    auto barrier=[&](VkCommandBuffer cmd){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);};
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline_layout,0,1,&o_set,0,nullptr);vkCmdPushConstants(cmd,linear.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,&o_pc);vkCmdDispatch(cmd,(uint32_t)hidden,(uint32_t)rows,1);barrier(cmd);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,add.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,add.pipeline_layout,0,1,&add_set,0,nullptr);vkCmdPushConstants(cmd,add.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&add_pc);vkCmdDispatch(cmd,(uint32_t)((rows*hidden+255)/256),1,1);barrier(cmd);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,norm.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,norm.pipeline_layout,0,1,&norm_set,0,nullptr);vkCmdPushConstants(cmd,norm.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,&norm_pc);vkCmdDispatch(cmd,(uint32_t)rows,1,1);barrier(cmd);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline_layout,0,1,&router_set,0,nullptr);vkCmdPushConstants(cmd,linear.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,&router_pc);vkCmdDispatch(cmd,(uint32_t)experts,(uint32_t)rows,1);
+    });
+}
+
 void linear_resident_io_vulkan(
     int64_t x_handle, int64_t h_w, int64_t h_b, int64_t y_handle,
     int64_t T, int64_t N, int64_t K, bool use_bias) {
@@ -1463,6 +1495,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v_weight_handle"), py::arg("v_bias_handle"),
           py::arg("v_handle"), py::arg("rows"), py::arg("hidden"),
           py::arg("q_size"), py::arg("kv_size"),
+          py::arg("eps") = 1e-5);
+    m.def("oproj_router_resident", &oproj_router_resident_vulkan,
+          "Fused resident O projection, residual, RMSNorm, and router.",
+          py::arg("attention_handle"), py::arg("o_weight_handle"),
+          py::arg("o_bias_handle"), py::arg("projected_handle"),
+          py::arg("residual_handle"), py::arg("residual_out_handle"),
+          py::arg("norm_weight_handle"), py::arg("normalized_handle"),
+          py::arg("router_weight_handle"), py::arg("router_bias_handle"),
+          py::arg("logits_handle"), py::arg("rows"), py::arg("hidden"),
+          py::arg("attention_size"), py::arg("experts"),
           py::arg("eps") = 1e-5);
     m.def("linear_resident_io", &linear_resident_io_vulkan,
           "FP32 linear layer with resident input, weight, bias, and output.",
