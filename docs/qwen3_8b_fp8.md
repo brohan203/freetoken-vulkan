@@ -37,10 +37,47 @@ A real layer-0 Q projection (`4096 x 4096`) produced:
 - mean absolute error: `1.050e-8`
 - finite FP32 output
 
+## Full model and resident generation
+
+The shared Qwen loader now detects FP8 matrices and dequantizes them lazily for
+the correctness path. The resident path stores raw FP8 matrices and their FP32
+scale grids directly.
+
+Verified full-model smoke:
+
+- finite logits shape `[1, 1, 151936]`
+- top prediction: ` Paris`
+- lazy full forward: `10.96 s`
+- mean lazy layer time: `0.292 s`
+
+Verified fully resident model:
+
+- all 36 FP8 layers resident
+- BF16 embeddings and LM head resident
+- resident allocation: `9,457,838,720` bytes (about 8.81 GiB)
+- pin time: `5.82-5.99 s`
+- one full resident token: `0.0977 s`
+- top-10 IDs exactly match the lazy dequantized model
+- maximum logit difference: `5.53e-5`
+- mean logit difference: `1.27e-5`
+
+Eight-token resident generation exactly matches the lazy reference:
+
+```text
+The capital of France is Paris. The capital of Italy is Rome
+```
+
+Performance:
+
+- lazy generation: `81.92 s`
+- resident generation: `1.01 s`
+- prompt processing: `0.0857 s/token`
+- decode: `0.0828 s/token` (about 12.1 tokens/second)
+- resident allocation unchanged before/after generation
+- explicit cleanup returns resident bytes exactly to zero
+
 ## Next gates
 
-1. Extend the Qwen loader with FP8 weight/scale pairs.
-2. Pin all Qwen3-8B FP8 layers resident.
-3. Validate one resident layer against Transformers dequantized math.
-4. Run full-model logits and greedy-generation parity.
-5. Benchmark sustained generation and memory stability.
+1. Fuse FP8 dense-layer submissions for higher throughput.
+2. Run a 320-token resident stability test.
+3. Add explicit 8B examples to the Qwen CLI documentation.

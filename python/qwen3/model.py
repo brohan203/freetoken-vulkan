@@ -10,7 +10,12 @@ import torch
 from dense_kv_cache import DenseKVCache
 from .config import load_qwen3_config
 from .layer import qwen3_layer_forward
-from .loader import ShardedSafetensors, _to_fp32, load_qwen3_layer
+from .loader import (
+    ShardedSafetensors,
+    _dequantize_fp8,
+    _to_fp32,
+    load_qwen3_layer,
+)
 from .rope import compute_rope
 
 
@@ -24,6 +29,15 @@ class Qwen3Model:
         self.tensors = ShardedSafetensors(self.model_dir)
         self.embed_tokens = self.tensors.get("model.embed_tokens.weight")
         self.final_norm = _to_fp32(self.tensors.get("model.norm.weight"))
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.embed_tokens
+        else:
+            head = self.tensors.get("lm_head.weight")
+            if head.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
+                scales = self.tensors.get("lm_head.weight_scale_inv")
+                self.lm_head = _dequantize_fp8(head, scales)
+            else:
+                self.lm_head = _to_fp32(head)
         self.layer_times: list[float] = []
         self.resident_weights = None
 
@@ -38,12 +52,28 @@ class Qwen3Model:
         from .resident import ResidentQwen3Weights
 
         resident = ResidentQwen3Weights(self.ext)
-        resident.pin_global(self.embed_tokens, self.final_norm)
+        sample = self.tensors.get("model.layers.0.self_attn.q_proj.weight")
+        fp8 = sample.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}
+        if self.config.tie_word_embeddings:
+            resident.pin_global(self.embed_tokens, self.final_norm)
+        elif fp8:
+            raw_head = self.tensors.get("lm_head.weight")
+            head_scale = None
+            if raw_head.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
+                head_scale = self.tensors.get("lm_head.weight_scale_inv")
+            resident.pin_global(
+                self.embed_tokens, self.final_norm, raw_head, head_scale
+            )
+        else:
+            resident.pin_global(self.embed_tokens, self.final_norm, self.lm_head)
         started = time.time()
         for layer_idx in range(self.config.num_hidden_layers):
-            weights = load_qwen3_layer(self.tensors, layer_idx)
-            resident.append(weights)
-            del weights
+            if fp8:
+                resident.append_fp8(self.tensors, layer_idx)
+            else:
+                weights = load_qwen3_layer(self.tensors, layer_idx)
+                resident.append(weights)
+                del weights
             if verbose and (layer_idx + 1) % 6 == 0:
                 gib = self.ext.resident_bytes_total() / 1024**3
                 print(
@@ -113,5 +143,4 @@ class Qwen3Model:
         )
         if only_last_logits:
             hidden = hidden[:, -1:, :]
-        lm_head = self.embed_tokens.float()
-        return hidden @ lm_head.T
+        return hidden @ self.lm_head.float().T

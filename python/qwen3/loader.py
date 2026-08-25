@@ -19,6 +19,21 @@ def _to_fp32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.float().contiguous()
 
 
+def _dequantize_fp8(
+    weight: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
+    if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
+        raise TypeError(f"unexpected FP8 dtype {weight.dtype}")
+    if weight.dim() != 2 or scales.dim() != 2:
+        raise ValueError("FP8 weight and scale tensors must be matrices")
+    block_rows = (weight.shape[0] + scales.shape[0] - 1) // scales.shape[0]
+    block_cols = (weight.shape[1] + scales.shape[1] - 1) // scales.shape[1]
+    expanded = scales.float().repeat_interleave(block_rows, 0)
+    expanded = expanded.repeat_interleave(block_cols, 1)
+    expanded = expanded[: weight.shape[0], : weight.shape[1]]
+    return (weight.float() * expanded).contiguous()
+
+
 class ShardedSafetensors:
     def __init__(self, model_dir: str | pathlib.Path):
         self.model_dir = pathlib.Path(model_dir).resolve()
@@ -54,19 +69,29 @@ def load_qwen3_layer(
     tensors: ShardedSafetensors, layer_idx: int
 ) -> DenseDecoderLayerWeights:
     prefix = f"model.layers.{layer_idx}"
-    get = lambda suffix: _to_fp32(tensors.get(f"{prefix}.{suffix}"))
+    def get(suffix: str) -> torch.Tensor:
+        return _to_fp32(tensors.get(f"{prefix}.{suffix}"))
+
+    def get_matrix(suffix: str) -> torch.Tensor:
+        name = f"{prefix}.{suffix}"
+        tensor = tensors.get(name)
+        if tensor.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
+            scales = tensors.get(name + "_scale_inv")
+            return _dequantize_fp8(tensor, scales)
+        return _to_fp32(tensor)
+
     return DenseDecoderLayerWeights(
         input_norm=get("input_layernorm.weight"),
         post_attention_norm=get("post_attention_layernorm.weight"),
-        q_weight=get("self_attn.q_proj.weight"),
-        k_weight=get("self_attn.k_proj.weight"),
-        v_weight=get("self_attn.v_proj.weight"),
-        o_weight=get("self_attn.o_proj.weight"),
+        q_weight=get_matrix("self_attn.q_proj.weight"),
+        k_weight=get_matrix("self_attn.k_proj.weight"),
+        v_weight=get_matrix("self_attn.v_proj.weight"),
+        o_weight=get_matrix("self_attn.o_proj.weight"),
         q_norm=get("self_attn.q_norm.weight"),
         k_norm=get("self_attn.k_norm.weight"),
-        gate_weight=get("mlp.gate_proj.weight"),
-        up_weight=get("mlp.up_proj.weight"),
-        down_weight=get("mlp.down_proj.weight"),
+        gate_weight=get_matrix("mlp.gate_proj.weight"),
+        up_weight=get_matrix("mlp.up_proj.weight"),
+        down_weight=get_matrix("mlp.down_proj.weight"),
     )
 
 

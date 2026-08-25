@@ -9,6 +9,7 @@ Verified end-to-end on one Radeon RX 6800 XT (16 GB VRAM, RDNA2, Navi 21):
 - `gpt-oss-20b`: approximately 0.034 s/token resident decode
 - `gpt-oss-120b`: approximately 0.229 s/token resident decode
 - `Qwen3-4B`: approximately 0.026 s/token resident decode
+- `Qwen3-8B-FP8`: approximately 0.083 s/token resident decode
 
 The backend uses GLSL compute shaders compiled to SPIR-V and a minimal C++
 Vulkan runtime. It is inspired by the NVIDIA/Triton-oriented
@@ -22,6 +23,7 @@ is a from-scratch implementation.
 - Full resident `gpt-oss-20b` with all canonical MXFP4 experts pinned
 - Streamed `gpt-oss-120b` with mmap-backed experts and bounded LFU VRAM cache
 - Full resident dense `Qwen3-4B` with native BF16 weights and FP32 accumulation
+- Full resident dense `Qwen3-8B-FP8` with block-scaled E4M3 weights
 - KV-cached generation for all supported models
 - GQA attention, RoPE, RMSNorm, dense SwiGLU, MXFP4 MoE, and attention sinks
 - Explicit model/workspace VRAM lifecycle with exact cleanup tests
