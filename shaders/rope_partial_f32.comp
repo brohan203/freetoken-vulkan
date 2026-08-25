@@ -1,0 +1,66 @@
+#version 450
+// rope_partial_f32.comp — partial rotary position embedding, in-place.
+//
+// Applies rotation to the FIRST rotary_dim dims of each head; leaves the
+// remaining (head_dim - rotary_dim) dims unchanged. cos/sin are precomputed
+// on the host (usually with YARN or NTK scaling for extended context) and
+// passed in as [S, rotary_dim] float tensors.
+//
+// For each (batch, head, seq, d):
+//   if d < rotary_dim / 2:
+//     y[d] = x[d] * cos[s, d] - x[d + rotary_dim/2] * sin[s, d]
+//   elif d < rotary_dim:
+//     y[d] = x[d] * cos[s, d] + x[d - rotary_dim/2] * sin[s, d]
+//   else:
+//     y[d] = x[d]        (unrotated)
+//
+// This matches the "rotate_half" variant used by HuggingFace transformers,
+// which is what gpt-oss's apply_rotary_pos_emb calls.
+//
+// Dispatch: (S, B*H, 1). One workgroup per (batch, head, query position).
+// Threads within a workgroup split across D.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufX   { float x[]; };   // [B, H, S, D]
+layout(std430, binding = 1) readonly  buffer BufCos { float cs[]; };  // [S, rotary_dim]
+layout(std430, binding = 2) readonly  buffer BufSin { float sn[]; };  // [S, rotary_dim]
+layout(std430, binding = 3) writeonly buffer BufY   { float y[]; };   // [B, H, S, D]
+
+layout(push_constant) uniform Params {
+    uint B_H;         // batch * heads
+    uint S;
+    uint D;
+    uint rotary_dim;  // must be even, <= D
+} p;
+
+void main() {
+    const uint s_idx  = gl_WorkGroupID.x;   // 0..S-1
+    const uint bh_idx = gl_WorkGroupID.y;   // 0..B*H-1
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint D          = p.D;
+    const uint rotary_dim = p.rotary_dim;
+    const uint half_rot   = rotary_dim / 2u;
+
+    // Base offset for this (batch, head, seq) triple into flat [B, H, S, D].
+    const uint row_off = (bh_idx * p.S + s_idx) * D;
+    const uint cs_off  = s_idx * rotary_dim;
+
+    for (uint d = tid; d < D; d += gl_WorkGroupSize.x) {
+        if (d < half_rot) {
+            const float c = cs[cs_off + d];
+            const float s = sn[cs_off + d];
+            const float xd  = x[row_off + d];
+            const float xd2 = x[row_off + d + half_rot];
+            y[row_off + d] = xd * c - xd2 * s;
+        } else if (d < rotary_dim) {
+            const float c = cs[cs_off + d];
+            const float s = sn[cs_off + d];
+            const float xd  = x[row_off + d];
+            const float xd2 = x[row_off + d - half_rot];
+            y[row_off + d] = xd * c + xd2 * s;
+        } else {
+            y[row_off + d] = x[row_off + d];
+        }
+    }
+}

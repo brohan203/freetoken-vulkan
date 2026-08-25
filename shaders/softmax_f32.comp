@@ -1,0 +1,81 @@
+#version 450
+// softmax_f32.comp — numerically-stable rowwise softmax. y = softmax(x, dim=-1).
+//
+// The naive `exp(x) / sum(exp(x))` overflows for x > ~88. Standard fix:
+// subtract row_max before the exp, which shifts all inputs to <= 0. This
+// gives the identical result mathematically but keeps every exp in [0, 1].
+//
+// Formula per row:
+//     row_max = max(x[i, :])
+//     e[j]    = exp(x[i, j] - row_max)
+//     y[i, j] = e[j] / sum(e[:])
+//
+// KEY IDEAS THIS SHADER INTRODUCES (that rmsnorm didn't):
+//
+// 1. Reduction with a non-add op. The first reduction is over `max`, not
+//    sum. Same shared-memory tree pattern, different combiner. Neutral
+//    element is -infinity (encoded as a large negative constant, since GLSL
+//    doesn't have a portable -inf literal).
+//
+// 2. Two independent reductions per invocation. Pass 1 = max, pass 2 = sum.
+//    Each needs its own barrier fences. Getting the barrier count right
+//    (one after write, one before overwrite) is a common bug source.
+//
+// 3. Intermediate stash. Pass 2 also writes exp(x - max) to y so that pass 3
+//    doesn't need to recompute exp (which is expensive on GPUs, several
+//    cycles per element vs. 1 cycle for a multiply). y[] is intentionally
+//    read-write, not writeonly.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer BufX { float x[]; };   // [N, D]
+layout(std430, binding = 1)          buffer BufY { float y[]; };   // [N, D]
+
+layout(push_constant) uniform Params {
+    uint D;
+} p;
+
+shared float sdata[256];
+
+const float NEG_LARGE = -3.4e38;   // ~= -FLT_MAX; safe neutral for max
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint WG   = gl_WorkGroupSize.x;
+    const uint D    = p.D;
+    const uint off  = row * D;
+
+    // ================ Pass 1: rowwise max ================
+    float local_max = NEG_LARGE;
+    for (uint j = tid; j < D; j += WG) {
+        local_max = max(local_max, x[off + j]);
+    }
+    sdata[tid] = local_max;
+    barrier();
+    for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        barrier();
+    }
+    const float row_max = sdata[0];
+
+    // ================ Pass 2: exp(x - max) into y, sum ================
+    float local_sum = 0.0;
+    for (uint j = tid; j < D; j += WG) {
+        float e = exp(x[off + j] - row_max);
+        y[off + j] = e;              // stash for pass 3
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    barrier();
+    for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        barrier();
+    }
+    const float inv_sum = 1.0 / sdata[0];
+
+    // ================ Pass 3: normalize ================
+    for (uint j = tid; j < D; j += WG) {
+        y[off + j] = y[off + j] * inv_sum;
+    }
+}

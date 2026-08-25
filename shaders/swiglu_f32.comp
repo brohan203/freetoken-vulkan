@@ -1,0 +1,35 @@
+#version 450
+// swiglu_f32.comp — SwiGLU activation, elementwise. Used in most modern LLM MLPs.
+//
+// SwiGLU(a, b) = silu(a) * b  where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//
+// Given two same-shaped tensors `gate` and `up` (the two halves of a 2*D_ff
+// projection), produces one output. Common in LLaMA / Phi / Qwen MLP:
+//
+//   MLP(x) = down_proj( silu(gate_proj(x)) * up_proj(x) )
+//                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this shader
+//
+// Fully elementwise, no reductions. Simple 1D dispatch, one thread per element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufGate { float gate[]; };
+layout(std430, binding = 1) readonly  buffer BufUp   { float up[];   };
+layout(std430, binding = 2) writeonly buffer BufOut  { float y[];    };
+
+layout(push_constant) uniform Params {
+    uint N;   // total element count (T * D_ff)
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.N) return;
+    const float g = gate[i];
+    // silu(g) = g / (1 + exp(-g))
+    // For large negative g, exp(-g) overflows. Use the numerically-stable
+    // formulation: silu(g) = g * sigmoid(g), and let GLSL's exp handle
+    // the tails — for g < -80 exp(-g) is inf but sigmoid clamps to 0, and
+    // 0 * g = 0 which is the right answer.
+    const float silu_g = g / (1.0 + exp(-g));
+    y[i] = silu_g * up[i];
+}

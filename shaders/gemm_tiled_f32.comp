@@ -1,0 +1,95 @@
+#version 450
+// gemm_tiled_f32.comp — shared-memory tiled GEMM. C = A @ B, row-major FP32.
+//
+// Same interface as gemm_naive, same dispatch geometry, same push constants.
+// The difference is inside: we bring K-strips of A and B into shared memory
+// once per BK-wide slice, then every thread reuses them from LDS instead
+// of hammering global memory.
+//
+// KEY IDEAS THIS SHADER INTRODUCES:
+//
+// 1. Tile-of-C partitioning. Each workgroup owns one BM×BN block of the
+//    output C. The 256 threads in the workgroup cooperate to compute those
+//    BM*BN = 256 output elements together (one per thread).
+//
+// 2. Cooperative K-strip loading. For each BK-wide slice along the K
+//    dimension, all 256 threads help load a BM×BK slab of A and a BK×BN
+//    slab of B into shared memory. Coalesced global reads become the
+//    single most important thing to get right — see comments below.
+//
+// 3. Reuse via LDS. Once the strips are in shared memory, each thread's
+//    inner k-loop reads from LDS (1-cycle latency on RDNA2's LDS bank)
+//    rather than global memory (100s of cycles). Every A/B element is
+//    read from global ONCE per K-strip instead of once per thread.
+//
+// 4. Barriers as the fundamental sync primitive. `barrier()` is what keeps
+//    "loaded" and "read" phases separate. Get one wrong and you get either
+//    stale data or torn reads. Both barriers below are load-bearing.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufA { float A[]; };   // [M, K]
+layout(std430, binding = 1) readonly  buffer BufB { float B[]; };   // [K, N]
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };   // [M, N]
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+const uint BM = 16;   // rows of C per workgroup
+const uint BN = 16;   // cols of C per workgroup
+const uint BK = 16;   // K-strip width per outer iteration
+
+// 2 KB of shared memory per workgroup, fits trivially in the 64 KB LDS
+// on each RDNA2 CU. Padding tricks to avoid bank conflicts come later.
+shared float As[BM][BK];   // A tile:  [BM][BK]
+shared float Bs[BK][BN];   // B tile:  [BK][BN]
+
+void main() {
+    // Convention: x = column of C (n), y = row of C (m). See gemm_naive
+    // header for why this makes writes to C coalesced.
+    const uint tx = gl_LocalInvocationID.x;   // 0..15
+    const uint ty = gl_LocalInvocationID.y;   // 0..15
+    const uint m  = gl_WorkGroupID.y * BM + ty;   // output row
+    const uint n  = gl_WorkGroupID.x * BN + tx;   // output col
+
+    float acc = 0.0;
+    const uint num_tiles = (p.K + BK - 1) / BK;
+
+    for (uint t = 0; t < num_tiles; ++t) {
+        const uint kA = t * BK + tx;   // K-index for A tile load (varies with tx)
+        const uint kB = t * BK + ty;   // K-index for B tile load (varies with ty)
+
+        // ---- Load A[m, kA] into As[ty][tx] ----
+        // Adjacent threads (adjacent tx) touch adjacent K addresses of A →
+        // consecutive floats in global memory → coalesced 16-way read.
+        As[ty][tx] = (m < p.M && kA < p.K) ? A[m * p.K + kA] : 0.0;
+
+        // ---- Load B[kB, n] into Bs[ty][tx] ----
+        // Same story: adjacent tx touch adjacent n → coalesced.
+        Bs[ty][tx] = (kB < p.K && n < p.N) ? B[kB * p.N + n] : 0.0;
+
+        // Wait for every thread to finish loading its slot before anyone
+        // starts reading from LDS. Without this barrier we'd read garbage.
+        barrier();
+
+        // ---- Inner k-loop: BK MAC ops out of LDS ----
+        // Each thread now reads its "row" of As and its "column" of Bs.
+        // As[ty] is broadcast across the 16 threads with the same ty.
+        // Bs[k][tx] is broadcast across the 16 threads with the same tx.
+        // Both fit LDS bank behavior nicely — one issue per bank per cycle.
+        for (uint k = 0; k < BK; ++k) {
+            acc = fma(As[ty][k], Bs[k][tx], acc);
+        }
+
+        // Wait for every thread to finish the inner loop before the next
+        // outer iteration overwrites the LDS tiles.
+        barrier();
+    }
+
+    if (m < p.M && n < p.N) {
+        C[m * p.N + n] = acc;
+    }
+}

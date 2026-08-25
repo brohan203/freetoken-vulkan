@@ -1,0 +1,206 @@
+#version 450
+// flash_attention_gpt_oss_f32.comp — gpt-oss-flavored FlashAttention v1.
+//
+// Extends flash_attention_mh with three features gpt-oss needs:
+//
+// 1. GQA (Grouped Query Attention). H_q Q-heads share H_kv KV-heads, with
+//    a fixed ratio H_q_per_kv = H_q / H_kv (e.g. 8:1 for gpt-oss-20b).
+//    Each Q head reads its own row of Q but the KV head shared across a
+//    group is read from the corresponding row of K, V.
+//
+// 2. Sliding window. If sliding_window > 0, kv_pos must satisfy
+//    (q_idx - sliding_window + 1) <= kv_pos <= q_idx  (causal AND local).
+//    If sliding_window == 0, only causal applies (kv_pos <= q_idx).
+//
+// 3. Attention sinks. Per-head learned scalar `sinks[h_q]` that acts as an
+//    extra "phantom" score in the softmax:
+//        combined = [Q·K^T + causal_mask, sinks[h_q]]     length S + 1
+//        probs    = softmax(combined)
+//        output   = probs[:S] · V                          (sink probability
+//                                                          dropped from V-mul)
+//    Implemented at the end by adjusting the online-softmax (m, l) with the
+//    sink logit: m_new = max(m, sink), l += exp(sink - m_new), O *= exp(m - m_new).
+//
+// Dispatch: (S, B*H_q, 1). One workgroup per (batch, q_head, query).
+// Workgroup: 128 threads.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufQ     { float Q[]; };      // [B, H_q,  S, D]
+layout(std430, binding = 1) readonly  buffer BufK     { float K[]; };      // [B, H_kv, S, D]
+layout(std430, binding = 2) readonly  buffer BufV     { float V[]; };      // [B, H_kv, S, D]
+layout(std430, binding = 3) readonly  buffer BufSinks { float sinks[]; };  // [H_q]
+layout(std430, binding = 4) writeonly buffer BufO     { float O[]; };      // [B, H_q,  S, D]
+
+layout(push_constant) uniform Params {
+    uint S;
+    uint D;
+    uint H_q;
+    uint H_kv;
+    uint H_q_per_kv;    // H_q / H_kv, precomputed by host
+    uint sliding_window; // 0 = disabled (full causal only)
+    uint use_sinks;      // 0 / 1
+    float scale;
+} p;
+
+const uint BC     = 32;
+const uint MAX_D  = 128;
+const uint WG     = 128;
+const float NEG_LARGE = -3.4e38;
+
+shared float Ks     [BC][MAX_D];
+shared float Vs     [BC][MAX_D];
+shared float qs     [MAX_D];
+shared float os     [MAX_D];
+shared float scores [BC];
+shared float sdata  [WG];
+
+shared float m_val;
+shared float l_val;
+
+void main() {
+    // Dispatch dims: x = q_idx, y = flat (batch * H_q + head_q) index.
+    const uint q_idx    = gl_WorkGroupID.x;
+    const uint bh_idx   = gl_WorkGroupID.y;
+    const uint tid      = gl_LocalInvocationID.x;
+
+    const uint S        = p.S;
+    const uint D        = p.D;
+    const uint H_q      = p.H_q;
+    const uint H_kv     = p.H_kv;
+
+    const uint batch    = bh_idx / H_q;
+    const uint head_q   = bh_idx % H_q;
+    const uint head_kv  = head_q / p.H_q_per_kv;
+
+    // Base offsets into flat [B, H, S, D] tensors.
+    const uint q_off_base = (batch * H_q  + head_q ) * S * D;
+    const uint k_off_base = (batch * H_kv + head_kv) * S * D;
+    const uint v_off_base = k_off_base;   // V has same [B, H_kv, S, D] layout
+    const uint o_off_base = q_off_base;
+
+    // Load Q[batch, head_q, q_idx, :] into LDS.
+    for (uint d = tid; d < D; d += WG) {
+        qs[d] = Q[q_off_base + q_idx * D + d];
+    }
+    for (uint d = tid; d < D; d += WG) os[d] = 0.0;
+    if (tid == 0) {
+        m_val = NEG_LARGE;
+        l_val = 0.0;
+    }
+    barrier();
+
+    const uint num_blocks = (S + BC - 1u) / BC;
+
+    for (uint b = 0; b < num_blocks; ++b) {
+        const uint k_start   = b * BC;
+        const uint block_len = min(BC, S - k_start);
+
+        // Cooperatively load K, V for this block.
+        for (uint i = tid; i < BC * D; i += WG) {
+            const uint kv_row = i / D;
+            const uint kv_col = i % D;
+            const uint gr     = k_start + kv_row;
+            const bool ok     = (kv_row < block_len) && (kv_col < D) && (gr < S);
+            Ks[kv_row][kv_col] = ok ? K[k_off_base + gr * D + kv_col] : 0.0;
+            Vs[kv_row][kv_col] = ok ? V[v_off_base + gr * D + kv_col] : 0.0;
+        }
+        barrier();
+
+        // Compute scores with causal + sliding window mask.
+        if (tid < BC) {
+            if (tid < block_len) {
+                const uint kv_pos = k_start + tid;
+                bool masked = (kv_pos > q_idx);           // causal
+                if (!masked && p.sliding_window > 0u) {
+                    // Sliding window: also require kv_pos > q_idx - window.
+                    // Guard against wrap when q_idx < window.
+                    if (q_idx >= p.sliding_window &&
+                        kv_pos < q_idx - p.sliding_window + 1u) {
+                        masked = true;
+                    }
+                }
+                if (masked) {
+                    scores[tid] = NEG_LARGE;
+                } else {
+                    float acc = 0.0;
+                    for (uint d = 0; d < D; ++d) {
+                        acc = fma(qs[d], Ks[tid][d], acc);
+                    }
+                    scores[tid] = acc * p.scale;
+                }
+            } else {
+                scores[tid] = NEG_LARGE;
+            }
+        }
+        barrier();
+
+        // Block max reduction.
+        sdata[tid] = (tid < BC) ? scores[tid] : NEG_LARGE;
+        barrier();
+        for (uint stride = WG / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+            barrier();
+        }
+        const float m_block = sdata[0];
+        const float m_new   = max(m_val, m_block);
+        const float alpha   = exp(m_val - m_new);
+
+        if (tid < BC) {
+            if (tid < block_len && scores[tid] > NEG_LARGE * 0.5) {
+                scores[tid] = exp(scores[tid] - m_new);
+            } else {
+                scores[tid] = 0.0;
+            }
+        }
+        barrier();
+
+        sdata[tid] = (tid < BC) ? scores[tid] : 0.0;
+        barrier();
+        for (uint stride = WG / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) sdata[tid] += sdata[tid + stride];
+            barrier();
+        }
+        const float block_sum = sdata[0];
+        const float l_new     = alpha * l_val + block_sum;
+
+        for (uint d = tid; d < D; d += WG) {
+            float pv = 0.0;
+            for (uint s = 0; s < BC; ++s) {
+                pv = fma(scores[s], Vs[s][d], pv);
+            }
+            os[d] = alpha * os[d] + pv;
+        }
+
+        if (tid == 0) {
+            m_val = m_new;
+            l_val = l_new;
+        }
+        barrier();
+    }
+
+    // ---- Apply attention sink (per-head learned softmax bias) ----
+    // The sink acts as an extra key/value slot where V = 0 — increases the
+    // softmax denominator, doesn't contribute to O. Handled after all KV
+    // blocks by adjusting m and l (and scaling O for the new max).
+    if (p.use_sinks != 0u) {
+        const float sink = sinks[head_q];
+        const float m_new = max(m_val, sink);
+        const float alpha_old = exp(m_val - m_new);
+        const float sink_exp  = exp(sink  - m_new);
+        for (uint d = tid; d < D; d += WG) {
+            os[d] = alpha_old * os[d];
+        }
+        if (tid == 0) {
+            l_val = alpha_old * l_val + sink_exp;
+            m_val = m_new;
+        }
+        barrier();
+    }
+
+    // Final normalize + write.
+    const float inv_l = (l_val > 0.0) ? (1.0 / l_val) : 0.0;
+    for (uint d = tid; d < D; d += WG) {
+        O[o_off_base + q_idx * D + d] = os[d] * inv_l;
+    }
+}

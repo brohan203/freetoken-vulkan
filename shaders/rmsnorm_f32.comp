@@ -1,0 +1,86 @@
+#version 450
+// rmsnorm_f32.comp — RMSNorm over the last dimension, FP32.
+//
+// Formula:  y = x * rsqrt(mean(x²) + eps) * weight
+// Layout:   x, y are [N, H] row-major float32. weight is [H] float32.
+// Dispatch: one workgroup per row. Workgroup size WG threads collaborate
+//           to reduce H elements down to one scalar (sum of squares).
+//
+// KEY IDEAS THIS SHADER INTRODUCES (that vector_add didn't):
+//
+// 1. Workgroup reduction. Each of WG=256 invocations computes a partial
+//    sum over a strided slice of the row. Then we tree-reduce those 256
+//    partials down to a single scalar using shared memory.
+//
+// 2. Shared memory (`shared float partial[WG]`) — the workgroup's
+//    scratchpad. Fast (on-chip SRAM), workgroup-scoped, needs explicit
+//    synchronization (`barrier()`) between writes and reads.
+//
+// 3. Two-pass pattern within one dispatch: pass 1 computes the reduction,
+//    pass 2 uses the reduced scalar to scale each element. Same invocations,
+//    same workgroup, just synchronized by the reduction barrier.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufX      { float x[]; };  // [N, H]
+layout(std430, binding = 1) readonly  buffer BufWeight { float w[]; };  // [H]
+layout(std430, binding = 2) writeonly buffer BufY      { float y[]; };  // [N, H]
+
+layout(push_constant) uniform Params {
+    uint  H;       // hidden dim (elements per row)
+    float eps;
+} params;
+
+// One shared slot per invocation in the workgroup. 256 * 4 bytes = 1 KB —
+// fits trivially in the ~64 KB LDS per compute unit on RDNA2.
+shared float partial[256];
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint WG   = gl_WorkGroupSize.x;   // 256
+    const uint H    = params.H;
+    const uint row_off = row * H;
+
+    // ================================================================
+    // Pass 1: each invocation computes a partial sum(x²) over a strided
+    // slice of the row. Stride = WG, so invocation `tid` reads elements
+    // tid, tid+WG, tid+2*WG, ... This gives coalesced memory access:
+    // adjacent invocations touch adjacent addresses on each step.
+    // ================================================================
+    float ss = 0.0;
+    for (uint j = tid; j < H; j += WG) {
+        float v = x[row_off + j];
+        ss = fma(v, v, ss);   // FMA: single-instruction v*v + ss on GPUs
+    }
+    partial[tid] = ss;
+
+    // Every invocation must finish writing to shared memory before ANY
+    // invocation reads its neighbors' slots. That's what barrier() enforces.
+    barrier();
+
+    // ================================================================
+    // Tree reduction: fold 256 -> 128 -> 64 -> ... -> 1 in log2(WG) steps.
+    // At each step, the lower half of active threads adds the upper half's
+    // value into its own slot. After the last step, partial[0] holds the
+    // total sum of squares for this row.
+    // ================================================================
+    for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+
+    // partial[0] is broadcast — every invocation reads the same value.
+    const float mean_sq = partial[0] / float(H);
+    const float scale   = inversesqrt(mean_sq + params.eps);
+
+    // ================================================================
+    // Pass 2: apply scale * weight[j] to each element of the row.
+    // Same striped access pattern as pass 1.
+    // ================================================================
+    for (uint j = tid; j < H; j += WG) {
+        y[row_off + j] = x[row_off + j] * scale * w[j];
+    }
+}

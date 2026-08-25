@@ -1,0 +1,40 @@
+#version 450
+// gemm_naive_f32.comp — the baseline. C = A @ B, all row-major float32.
+//
+// One GPU invocation per element of C. Each does the full K-loop reading
+// A[m, :] and B[:, n] straight from global memory — no shared memory,
+// no tiling, no reuse. Slow, and that's the point: correctness reference
+// + perf floor.
+//
+// Convention: local_x → n (column of C, fast dim in row-major).
+//             local_y → m (row of C).
+// This makes writes to C[m,n] coalesced across a wave, since neighbouring
+// threads (adjacent thx) touch adjacent memory addresses.
+//
+// Dispatch:  gx = ceil(N / 16), gy = ceil(M / 16), gz = 1
+// Workgroup: 16 × 16 = 256 invocations.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufA { float A[]; };   // [M, K]
+layout(std430, binding = 1) readonly  buffer BufB { float B[]; };   // [K, N]
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };   // [M, N]
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    uint m = gl_GlobalInvocationID.y;
+
+    if (m >= p.M || n >= p.N) return;
+
+    float acc = 0.0;
+    for (uint k = 0; k < p.K; ++k) {
+        acc = fma(A[m * p.K + k], B[k * p.N + n], acc);
+    }
+    C[m * p.N + n] = acc;
+}

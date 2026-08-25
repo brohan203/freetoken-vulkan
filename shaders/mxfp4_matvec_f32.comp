@@ -1,0 +1,81 @@
+#version 450
+// mxfp4_matvec_f32.comp — MXFP4-weights × FP32-activations matvec.
+//
+// y[j] = sum_i W[j, i] * x[i]   for j in [0, M)
+//
+// W storage:
+//   blocks  [M, N_blocks, 16] uint8   packed FP4 (2 values per byte, low nibble first)
+//   scales  [M, N_blocks]     uint8   E8M0 exponent per 32-element block
+//   Block size = 32 K-elements per block.
+//   Total K = N_blocks × 32.
+//
+// This is the FOUNDATIONAL kernel for MXFP4 support. Correctness first,
+// perf later — one thread per output element, K reduction fully serial
+// inside the thread. Later versions will:
+//   - Cache x in LDS to avoid re-reading from global for each row
+//   - Coalesce block reads via uint32 packing (4 bytes at a time)
+//   - Vectorize the inner block loop
+//
+// Dispatch: (ceil(M / 64), 1, 1).  Workgroup = 64 threads = 64 output rows/wg.
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufBlocks { uint8_t blocks[]; }; // [M, NB, 16]
+layout(std430, binding = 1) readonly  buffer BufScales { uint8_t scales[]; }; // [M, NB]
+layout(std430, binding = 2) readonly  buffer BufX      { float   x[]; };       // [K]
+layout(std430, binding = 3) writeonly buffer BufY      { float   y[]; };       // [M]
+
+layout(push_constant) uniform Params {
+    uint M;         // output rows
+    uint K;         // input dim (must be multiple of 32)
+    uint N_blocks;  // K / 32
+} p;
+
+// E2M1 FP4 lookup table. Index in [0, 15]. See docs/mxfp4 or e028 journal
+// entry for encoding.
+const float FP4_LUT[16] = float[](
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x;
+    if (j >= p.M) return;
+
+    const uint NB = p.N_blocks;
+    // W row j: blocks at offset j*NB*16, scales at j*NB.
+    const uint blocks_row_off = j * NB * 16u;
+    const uint scales_row_off = j * NB;
+
+    float acc = 0.0;
+
+    for (uint b = 0; b < NB; ++b) {
+        // E8M0 scale byte → 2^(byte - 127) via IEEE-754 bit reinterpretation:
+        // FP32 bit pattern = (biased_exp << 23), where biased_exp = byte.
+        // This maps byte 127 → 1.0, byte 128 → 2.0, byte 126 → 0.5.
+        const uint scale_byte = uint(scales[scales_row_off + b]);
+        const float scale = uintBitsToFloat(scale_byte << 23);
+
+        const uint block_off = blocks_row_off + b * 16u;
+        const uint x_off     = b * 32u;
+
+        // 16 packed bytes → 32 FP4 values → 32 FMAs.
+        for (uint bi = 0; bi < 16; ++bi) {
+            const uint packed = uint(blocks[block_off + bi]);
+            const uint lo = packed & 0x0Fu;
+            const uint hi = (packed >> 4) & 0x0Fu;
+
+            const float w_lo = FP4_LUT[lo] * scale;
+            const float w_hi = FP4_LUT[hi] * scale;
+
+            // Low nibble is element (2*bi), high nibble is (2*bi + 1).
+            acc = fma(w_lo, x[x_off + bi * 2 + 0u], acc);
+            acc = fma(w_hi, x[x_off + bi * 2 + 1u], acc);
+        }
+    }
+
+    y[j] = acc;
+}

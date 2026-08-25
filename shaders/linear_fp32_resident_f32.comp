@@ -1,0 +1,57 @@
+#version 450
+// linear_fp32_resident_f32.comp — FP32 y = x @ W.T + b matmul where W and
+// bias are RESIDENT VRAM buffers. Suitable for LM head and Q/K/V/O
+// projections (once we make them GPU-side too).
+//
+// Convention: W is stored [N, K] row-major (HuggingFace's linear.weight
+// shape). So y[t, n] = sum_k x[t, k] * W[n, k] + b[n].
+//
+// Dispatch: (N, T, 1). One workgroup per output element.
+// Each workgroup: 128 threads, K reduction split.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufW { float W[]; };   // [N, K]
+layout(std430, binding = 1) readonly  buffer BufB { float B[]; };   // [N]
+layout(std430, binding = 2) readonly  buffer BufX { float X[]; };   // [T, K]
+layout(std430, binding = 3) writeonly buffer BufY { float Y[]; };   // [T, N]
+
+layout(push_constant) uniform Params {
+    uint T;
+    uint N;
+    uint K;
+    uint use_bias;  // 0/1
+} p;
+
+shared float sdata[128];
+
+void main() {
+    const uint n   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (n >= p.N || t >= p.T) return;
+
+    // Each thread accumulates a partial sum over K.
+    const uint K = p.K;
+    const uint w_row_off = n * K;
+    const uint x_row_off = t * K;
+
+    float acc = 0.0;
+    for (uint k = tid; k < K; k += 128) {
+        acc = fma(X[x_row_off + k], W[w_row_off + k], acc);
+    }
+
+    // Workgroup reduction.
+    sdata[tid] = acc;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    if (tid == 0) {
+        float v = sdata[0];
+        if (p.use_bias != 0u) v += B[n];
+        Y[t * p.N + n] = v;
+    }
+}

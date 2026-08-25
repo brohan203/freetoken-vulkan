@@ -1,0 +1,122 @@
+#version 450
+// moe_mlp_lg_f32.comp — Large-shape MoE MLP with Dff blocking.
+//
+// Extends moe_mlp_f32.comp to handle real MoE model sizes. The current
+// (small) shader keeps the full gate/up intermediate arrays in LDS (Dff
+// floats each) which caps at Dff ≤ 512. Real Phi-3.5-MoE has Dff = 6400
+// and D = 4096 — 76 KB of gate + up + acc + xs, blowing past the 64 KB
+// LDS/CU budget.
+//
+// Fix: block Dff into chunks of BDFF. Each chunk we:
+//   (1) compute BDFF gate values into gs[]
+//   (2) compute BDFF up values into us[]
+//   (3) SwiGLU inline: gs[i] = silu(gs[i]) * us[i]
+//   (4) contribute this chunk to the output: acc[d] += w * <W_down[e, d, chunk], gs>
+//
+// This means each expert's W_down is read Dff/BDFF times per output d.
+// Not asymptotically great, but keeps LDS budget in check and is what
+// llama.cpp Vulkan does for the same reason. See SKIPPED for grouped-GEMM
+// alternative that avoids the reread.
+//
+// LDS budget at MAX_D=4096, BDFF=512:
+//   xs[4096]    = 16 KB
+//   gs[512]     = 2 KB
+//   us[512]     = 2 KB
+//   acc[4096]   = 16 KB
+//   Total       = 36 KB   (fits 64 KB LDS/CU on RDNA2; occupancy = 1 wg/CU)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufX       { float x[]; };
+layout(std430, binding = 1) readonly  buffer BufIndices { uint  indices[]; };
+layout(std430, binding = 2) readonly  buffer BufWeights { float weights[]; };
+layout(std430, binding = 3) readonly  buffer BufWGate   { float W_gate[]; };
+layout(std430, binding = 4) readonly  buffer BufWUp     { float W_up[]; };
+layout(std430, binding = 5) readonly  buffer BufWDown   { float W_down[]; };
+layout(std430, binding = 6) writeonly buffer BufY       { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint T;
+    uint D;
+    uint Dff;
+    uint E;
+    uint K;
+} p;
+
+const uint MAX_D = 4096;
+const uint BDFF  = 512;
+const uint WG    = 128;
+
+shared float xs [MAX_D];
+shared float gs [BDFF];    // Current Dff chunk (post-SwiGLU is stored back here)
+shared float us [BDFF];
+shared float acc[MAX_D];
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint D   = p.D;
+    const uint Dff = p.Dff;
+    const uint K   = p.K;
+
+    // Load token input; init accumulator.
+    for (uint d = tid; d < D; d += WG) xs[d]  = x[tok * D + d];
+    for (uint d = tid; d < D; d += WG) acc[d] = 0.0;
+    barrier();
+
+    for (uint k = 0; k < K; ++k) {
+        const uint  e = indices[tok * K + k];
+        const float w = weights[tok * K + k];
+
+        const uint num_chunks = (Dff + BDFF - 1) / BDFF;
+        for (uint c = 0; c < num_chunks; ++c) {
+            const uint dff_start = c * BDFF;
+            const uint chunk_len = min(BDFF, Dff - dff_start);
+
+            // ---- Compute gate chunk: gs[i] = <W_gate[e, dff_start+i, :], xs> ----
+            for (uint i = tid; i < chunk_len; i += WG) {
+                float dot = 0.0;
+                uint  row_off = (e * Dff + dff_start + i) * D;
+                for (uint d = 0; d < D; ++d) {
+                    dot = fma(W_gate[row_off + d], xs[d], dot);
+                }
+                gs[i] = dot;
+            }
+
+            // ---- Compute up chunk ----
+            for (uint i = tid; i < chunk_len; i += WG) {
+                float dot = 0.0;
+                uint  row_off = (e * Dff + dff_start + i) * D;
+                for (uint d = 0; d < D; ++d) {
+                    dot = fma(W_up[row_off + d], xs[d], dot);
+                }
+                us[i] = dot;
+            }
+            // No barrier between gate and up writes — different arrays, both
+            // per-thread. SwiGLU below only reads own slot, so still no barrier
+            // needed. Barrier comes before the down-matmul which reads gs[]
+            // across all threads.
+
+            // ---- SwiGLU inline: gs[i] = silu(gs[i]) * us[i] ----
+            for (uint i = tid; i < chunk_len; i += WG) {
+                float g = gs[i];
+                float silu = g / (1.0 + exp(-g));
+                gs[i] = silu * us[i];
+            }
+            barrier();
+
+            // ---- Down + accumulate: acc[d] += w * <W_down[e, d, chunk], gs> ----
+            for (uint d = tid; d < D; d += WG) {
+                float dot = 0.0;
+                uint  row_off = (e * D + d) * Dff + dff_start;
+                for (uint i = 0; i < chunk_len; ++i) {
+                    dot = fma(W_down[row_off + i], gs[i], dot);
+                }
+                acc[d] = fma(w, dot, acc[d]);
+            }
+            barrier();
+        }
+    }
+
+    for (uint d = tid; d < D; d += WG) y[tok * D + d] = acc[d];
+}

@@ -1,0 +1,196 @@
+#version 450
+// moe_mlp_mxfp4_gpt_oss_par_f32.comp — parallel-experts variant of the
+// gpt-oss MoE MLP.  Instead of iterating K experts sequentially inside
+// one workgroup of 128 threads, we allocate a "lane" of 128 threads per
+// expert (so WG = 128 * K = 512 for gpt-oss's K=4). All K experts compute
+// in parallel; a final reduction sums expert contributions into y[t].
+//
+// LDS budget for gpt-oss (D=Dff=2880, K=4):
+//   xs[2880]           11 520 B
+//   partial_y[4][2880] 46 080 B
+//   gate_chunk[4][64]     1 024 B
+//   up_chunk  [4][64]     1 024 B
+//   hidden_chunk[4][64]   1 024 B
+//   Total              ~61 KB   — just fits 64 KB LDS/CU.
+// Occupancy: 1 workgroup per CU (fine — decode T=1 launches 1 wg anyway).
+//
+// Dispatch: (T, 1, 1). One workgroup per token.
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufGUBlocks { uint8_t gu_blocks[]; };
+layout(std430, binding = 1) readonly  buffer BufGUScales { uint8_t gu_scales[]; };
+layout(std430, binding = 2) readonly  buffer BufGUBias   { float   gu_bias[]; };
+layout(std430, binding = 3) readonly  buffer BufDBlocks  { uint8_t d_blocks[]; };
+layout(std430, binding = 4) readonly  buffer BufDScales  { uint8_t d_scales[]; };
+layout(std430, binding = 5) readonly  buffer BufDBias    { float   d_bias[]; };
+layout(std430, binding = 6) readonly  buffer BufX        { float   x[]; };
+layout(std430, binding = 7) readonly  buffer BufIndices  { uint    indices[]; };
+layout(std430, binding = 8) readonly  buffer BufWeights  { float   weights[]; };
+layout(std430, binding = 9) writeonly buffer BufY        { float   y[]; };
+
+layout(push_constant) uniform Params {
+    uint T;
+    uint D;
+    uint Dff;
+    uint E;
+    uint K;    // must be 4 for this shader (compile-time constants below)
+} p;
+
+const uint MAX_D  = 2880;
+const uint K_MAX  = 4;
+const uint LANE   = 128;         // threads per expert
+const uint BDFF   = 64;
+const uint WG     = K_MAX * LANE;  // 512
+
+const float ALPHA = 1.702;
+const float LIMIT = 7.0;
+
+const float FP4_LUT[16] = float[](
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+shared float xs           [MAX_D];
+shared float partial_y    [K_MAX][MAX_D];
+shared float gate_chunk   [K_MAX][BDFF];
+shared float up_chunk     [K_MAX][BDFF];
+shared float hidden_chunk [K_MAX][BDFF];
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint slot = tid / LANE;         // 0..K-1  (which expert we handle)
+    const uint lane_tid = tid - slot * LANE;  // 0..LANE-1
+
+    const uint D = p.D;
+    const uint Dff = p.Dff;
+    const uint NB_D   = D   / 32u;
+    const uint NB_Dff = Dff / 32u;
+    const uint K = p.K;         // == K_MAX
+
+    // Load token input xs.
+    for (uint d = tid; d < D; d += WG) xs[d] = x[tok * D + d];
+
+    // Zero-init partial_y (all K slots).
+    for (uint i = tid; i < K_MAX * D; i += WG) {
+        uint s = i / D;
+        uint d = i - s * D;
+        partial_y[s][d] = 0.0;
+    }
+    barrier();
+
+    // Our expert & router weight for this slot.
+    const uint e = indices[tok * K + slot];
+    const float w = weights[tok * K + slot];
+
+    const uint num_chunks = (Dff + BDFF - 1u) / BDFF;
+    for (uint c = 0; c < num_chunks; ++c) {
+        const uint dff_start = c * BDFF;
+
+        // Gate/Up phase: half the lane threads compute gate, half compute up.
+        if (lane_tid < BDFF) {
+            uint i = lane_tid;
+            uint row = 2u * (dff_start + i);
+            if (dff_start + i < Dff) {
+                uint blocks_row_off = (e * 2u * Dff + row) * NB_D * 16u;
+                uint scales_row_off = (e * 2u * Dff + row) * NB_D;
+                float acc_v = 0.0;
+                for (uint b = 0; b < NB_D; ++b) {
+                    uint scale_byte = uint(gu_scales[scales_row_off + b]);
+                    float scale = uintBitsToFloat(scale_byte << 23);
+                    uint block_off = blocks_row_off + b * 16u;
+                    uint x_off = b * 32u;
+                    for (uint bi = 0; bi < 16; ++bi) {
+                        uint packed = uint(gu_blocks[block_off + bi]);
+                        float w_lo = FP4_LUT[packed & 0x0Fu] * scale;
+                        float w_hi = FP4_LUT[(packed >> 4) & 0x0Fu] * scale;
+                        acc_v = fma(w_lo, xs[x_off + bi * 2 + 0u], acc_v);
+                        acc_v = fma(w_hi, xs[x_off + bi * 2 + 1u], acc_v);
+                    }
+                }
+                gate_chunk[slot][i] = acc_v + gu_bias[e * 2u * Dff + row];
+            } else {
+                gate_chunk[slot][i] = 0.0;
+            }
+        } else if (lane_tid < 2u * BDFF) {
+            uint i = lane_tid - BDFF;
+            uint row = 2u * (dff_start + i) + 1u;
+            if (dff_start + i < Dff) {
+                uint blocks_row_off = (e * 2u * Dff + row) * NB_D * 16u;
+                uint scales_row_off = (e * 2u * Dff + row) * NB_D;
+                float acc_v = 0.0;
+                for (uint b = 0; b < NB_D; ++b) {
+                    uint scale_byte = uint(gu_scales[scales_row_off + b]);
+                    float scale = uintBitsToFloat(scale_byte << 23);
+                    uint block_off = blocks_row_off + b * 16u;
+                    uint x_off = b * 32u;
+                    for (uint bi = 0; bi < 16; ++bi) {
+                        uint packed = uint(gu_blocks[block_off + bi]);
+                        float w_lo = FP4_LUT[packed & 0x0Fu] * scale;
+                        float w_hi = FP4_LUT[(packed >> 4) & 0x0Fu] * scale;
+                        acc_v = fma(w_lo, xs[x_off + bi * 2 + 0u], acc_v);
+                        acc_v = fma(w_hi, xs[x_off + bi * 2 + 1u], acc_v);
+                    }
+                }
+                up_chunk[slot][i] = acc_v + gu_bias[e * 2u * Dff + row];
+            } else {
+                up_chunk[slot][i] = 0.0;
+            }
+        }
+        barrier();
+
+        // Activation.
+        if (lane_tid < BDFF && dff_start + lane_tid < Dff) {
+            float g = min(gate_chunk[slot][lane_tid], LIMIT);
+            float u = clamp(up_chunk[slot][lane_tid], -LIMIT, LIMIT);
+            float glu = g * (1.0 / (1.0 + exp(-g * ALPHA)));
+            hidden_chunk[slot][lane_tid] = (u + 1.0) * glu;
+        } else if (lane_tid < BDFF) {
+            hidden_chunk[slot][lane_tid] = 0.0;
+        }
+        barrier();
+
+        // Down phase: this expert's contribution to partial_y[slot][:].
+        // lane_tid strides across D (LANE threads split D rows).
+        uint first_block = dff_start / 32u;
+        for (uint d = lane_tid; d < D; d += LANE) {
+            uint blocks_row_off = (e * D + d) * NB_Dff * 16u;
+            uint scales_row_off = (e * D + d) * NB_Dff;
+            float acc_v = 0.0;
+            for (uint bb = 0; bb < 2u; ++bb) {
+                uint b = first_block + bb;
+                uint scale_byte = uint(d_scales[scales_row_off + b]);
+                float scale = uintBitsToFloat(scale_byte << 23);
+                uint block_off = blocks_row_off + b * 16u;
+                for (uint bi = 0; bi < 16; ++bi) {
+                    uint packed = uint(d_blocks[block_off + bi]);
+                    float w_lo = FP4_LUT[packed & 0x0Fu] * scale;
+                    float w_hi = FP4_LUT[(packed >> 4) & 0x0Fu] * scale;
+                    uint h0 = bb * 32u + bi * 2u + 0u;
+                    uint h1 = bb * 32u + bi * 2u + 1u;
+                    acc_v = fma(w_lo, hidden_chunk[slot][h0], acc_v);
+                    acc_v = fma(w_hi, hidden_chunk[slot][h1], acc_v);
+                }
+            }
+            partial_y[slot][d] += w * acc_v;
+        }
+        barrier();
+    }
+
+    // Add down_bias weighted by w to this expert's partial_y.
+    for (uint d = lane_tid; d < D; d += LANE) {
+        partial_y[slot][d] += w * d_bias[e * D + d];
+    }
+    barrier();
+
+    // Reduction: sum over K experts into y[tok, d]. All 512 threads.
+    for (uint d = tid; d < D; d += WG) {
+        float sum = 0.0;
+        for (uint k = 0; k < K; ++k) sum += partial_y[k][d];
+        y[tok * D + d] = sum;
+    }
+}

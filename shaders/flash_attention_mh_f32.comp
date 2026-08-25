@@ -1,0 +1,159 @@
+#version 450
+// flash_attention_mh_f32.comp — Multi-head FlashAttention v1 with optional
+// causal mask. FP32.
+//
+// Extensions over flash_attention_f32.comp:
+//   1. Multi-head/batch: Q, K, V, O laid out as [BH, S, D] flat where
+//      BH = batch * heads. Each (batch, head) attention is independent —
+//      the dispatch adds a Y dimension so gl_WorkGroupID.y indexes into
+//      the head, and gl_WorkGroupID.x indexes the query row within head.
+//   2. Causal mask: if enabled, scores at positions kv > q are masked out
+//      (set to -inf so softmax sends them 0 probability). This is what
+//      standard transformer decode requires.
+//
+// Same algorithm, same online-softmax recurrence as the single-head kernel.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufQ { float Q[]; };   // [BH, S, D]
+layout(std430, binding = 1) readonly  buffer BufK { float K[]; };   // [BH, S, D]
+layout(std430, binding = 2) readonly  buffer BufV { float V[]; };   // [BH, S, D]
+layout(std430, binding = 3) writeonly buffer BufO { float O[]; };   // [BH, S, D]
+
+layout(push_constant) uniform Params {
+    uint  S;
+    uint  D;
+    uint  BH;      // batch * heads
+    uint  causal;  // 0 = no mask, 1 = apply causal
+    float scale;
+} p;
+
+const uint BC     = 32;
+const uint MAX_D  = 128;
+const uint WG     = 128;
+
+shared float Ks     [BC][MAX_D];
+shared float Vs     [BC][MAX_D];
+shared float qs     [MAX_D];
+shared float os     [MAX_D];
+shared float scores [BC];
+shared float sdata  [WG];
+
+shared float m_val;
+shared float l_val;
+
+const float NEG_LARGE = -3.4e38;
+
+void main() {
+    // gl_WorkGroupID.x = which query index within a head/batch
+    // gl_WorkGroupID.y = which (batch, head) index (0 .. BH-1)
+    const uint q_idx     = gl_WorkGroupID.x;
+    const uint bh_idx    = gl_WorkGroupID.y;
+    const uint tid       = gl_LocalInvocationID.x;
+    const uint S         = p.S;
+    const uint D         = p.D;
+    // Base offset into flat [BH, S, D] arrays for this (batch, head).
+    const uint head_off  = bh_idx * S * D;
+
+    // ---- Load Q[bh_idx, q_idx, :] into LDS ----
+    for (uint d = tid; d < D; d += WG) {
+        qs[d] = Q[head_off + q_idx * D + d];
+    }
+    for (uint d = tid; d < D; d += WG) os[d] = 0.0;
+    if (tid == 0) {
+        m_val = NEG_LARGE;
+        l_val = 0.0;
+    }
+    barrier();
+
+    const uint num_blocks = (S + BC - 1) / BC;
+
+    for (uint b = 0; b < num_blocks; ++b) {
+        const uint k_start = b * BC;
+        const uint block_len = min(BC, S - k_start);
+
+        // Cooperatively load K, V blocks — same as single-head, offset by head_off.
+        for (uint i = tid; i < BC * D; i += WG) {
+            const uint kv_row = i / D;
+            const uint kv_col = i % D;
+            const uint gr     = k_start + kv_row;
+            const bool ok     = (kv_row < block_len) && (kv_col < D) && (gr < S);
+            Ks[kv_row][kv_col] = ok ? K[head_off + gr * D + kv_col] : 0.0;
+            Vs[kv_row][kv_col] = ok ? V[head_off + gr * D + kv_col] : 0.0;
+        }
+        barrier();
+
+        // Score computation with optional causal mask.
+        if (tid < BC) {
+            if (tid < block_len) {
+                const uint kv_pos = k_start + tid;
+                // Causal mask: only allow attention to kv_pos <= q_idx.
+                bool masked_out = (p.causal != 0u) && (kv_pos > q_idx);
+                if (masked_out) {
+                    scores[tid] = NEG_LARGE;
+                } else {
+                    float acc = 0.0;
+                    for (uint d = 0; d < D; ++d) {
+                        acc = fma(qs[d], Ks[tid][d], acc);
+                    }
+                    scores[tid] = acc * p.scale;
+                }
+            } else {
+                scores[tid] = NEG_LARGE;
+            }
+        }
+        barrier();
+
+        // Block max reduction.
+        sdata[tid] = (tid < BC) ? scores[tid] : NEG_LARGE;
+        barrier();
+        for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+            barrier();
+        }
+        const float m_block = sdata[0];
+
+        const float m_new = max(m_val, m_block);
+        const float alpha = exp(m_val - m_new);
+
+        if (tid < BC) {
+            if (tid < block_len && scores[tid] > NEG_LARGE * 0.5) {
+                // scores[tid] holds a real score; convert to prob-numerator.
+                scores[tid] = exp(scores[tid] - m_new);
+            } else {
+                scores[tid] = 0.0;
+            }
+        }
+        barrier();
+
+        sdata[tid] = (tid < BC) ? scores[tid] : 0.0;
+        barrier();
+        for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sdata[tid] += sdata[tid + stride];
+            barrier();
+        }
+        const float block_sum = sdata[0];
+        const float l_new = alpha * l_val + block_sum;
+
+        for (uint d = tid; d < D; d += WG) {
+            float pv = 0.0;
+            for (uint s = 0; s < BC; ++s) {
+                pv = fma(scores[s], Vs[s][d], pv);
+            }
+            os[d] = alpha * os[d] + pv;
+        }
+
+        if (tid == 0) {
+            m_val = m_new;
+            l_val = l_new;
+        }
+        barrier();
+    }
+
+    // Handle the causal edge case where a query attends to nothing (only when
+    // there are no valid keys — shouldn't happen with S >= 1, but be safe).
+    const float inv_l = (l_val > 0.0) ? (1.0 / l_val) : 0.0;
+    for (uint d = tid; d < D; d += WG) {
+        O[head_off + q_idx * D + d] = os[d] * inv_l;
+    }
+}

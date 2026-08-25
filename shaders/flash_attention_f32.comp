@@ -1,0 +1,184 @@
+#version 450
+// flash_attention_f32.comp — FlashAttention v1, single-head, Br=1.
+//
+// out = softmax(Q @ K^T * scale, dim=-1) @ V
+//
+// The point of this shader vs. attention_naive: no full-S score buffer.
+// We iterate KV in blocks of BC, maintain running (m, l, O), and use the
+// online-softmax renormalization to keep everything correct at each step.
+// LDS use is O(D + BC) instead of O(S), so this scales to any S.
+//
+// One workgroup per query, so this is essentially "flash decode": very
+// efficient when you have S queries to process in parallel. For much
+// higher throughput on training-shaped attention you'd want Br > 1 —
+// see SKIPPED.md.
+//
+// ALGORITHM (Dao et al. 2022, Algorithm 1, simplified for Br=1):
+//
+//   O ← 0            (length D)
+//   m ← -inf         (scalar: running row max)
+//   l ← 0            (scalar: running softmax denominator)
+//   for each KV block j (each block has BC keys):
+//       s_j ← Q · K_j^T * scale                    (length BC)
+//       m_j ← max(s_j)                              (scalar)
+//       m_new ← max(m, m_j)                         (scalar)
+//       α ← exp(m - m_new)      # rescale old accum
+//       β vec: p_j ← exp(s_j - m_new)               (length BC)
+//       l_new ← α * l + sum(p_j)                    (scalar)
+//       O ← α * O + p_j @ V_j                       (length D)
+//       m ← m_new
+//       l ← l_new
+//   O ← O / l   (final normalization)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufQ { float Q[]; };   // [S, D]
+layout(std430, binding = 1) readonly  buffer BufK { float K[]; };   // [S, D]
+layout(std430, binding = 2) readonly  buffer BufV { float V[]; };   // [S, D]
+layout(std430, binding = 3) writeonly buffer BufO { float O[]; };   // [S, D]
+
+layout(push_constant) uniform Params {
+    uint  S;
+    uint  D;
+    float scale;
+} p;
+
+const uint BC     = 32;    // KV block size — 32*128*4*2 = 32 KB LDS for K+V
+const uint MAX_D  = 128;   // supported head dims
+const uint WG     = 128;
+
+// LDS layout (with BC=32, MAX_D=128, WG=128):
+//   Ks[32][128]  = 16 KB
+//   Vs[32][128]  = 16 KB
+//   qs[128]      = 512 B
+//   os[128]      = 512 B
+//   scores[32]   = 128 B
+//   sdata[128]   = 512 B
+//   m_val, l_val = 8 B
+// Total: ~33.7 KB — fits in RDNA2's 64 KB LDS/CU with headroom for
+// occupancy. Larger BC = fewer outer iterations but bigger LDS pressure,
+// tuning noted in SKIPPED.md.
+
+shared float Ks     [BC][MAX_D];
+shared float Vs     [BC][MAX_D];
+shared float qs     [MAX_D];
+shared float os     [MAX_D];
+shared float scores [BC];
+shared float sdata  [WG];
+
+shared float m_val;    // running row max  (scalar, updated by tid=0)
+shared float l_val;    // running softmax sum (scalar)
+
+const float NEG_LARGE = -3.4e38;
+
+void main() {
+    const uint q_idx = gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint S     = p.S;
+    const uint D     = p.D;
+
+    // ---- Load Q[q_idx] into LDS once ----
+    for (uint d = tid; d < D; d += WG) {
+        qs[d] = Q[q_idx * D + d];
+    }
+    // ---- Initialize accumulator ----
+    for (uint d = tid; d < D; d += WG) {
+        os[d] = 0.0;
+    }
+    if (tid == 0) {
+        m_val = NEG_LARGE;
+        l_val = 0.0;
+    }
+    barrier();
+
+    const uint num_blocks = (S + BC - 1) / BC;
+
+    // ============================================================
+    // Iterate KV blocks
+    // ============================================================
+    for (uint b = 0; b < num_blocks; ++b) {
+        const uint k_start = b * BC;
+        const uint block_len = min(BC, S - k_start);
+
+        // ---- Cooperatively load Ks and Vs blocks (BC×D floats each) ----
+        for (uint i = tid; i < BC * D; i += WG) {
+            const uint kv_row = i / D;   // 0..BC-1
+            const uint kv_col = i % D;   // 0..D-1
+            const uint gr     = k_start + kv_row;
+            const bool ok     = (kv_row < block_len) && (kv_col < D) && (gr < S);
+            Ks[kv_row][kv_col] = ok ? K[gr * D + kv_col] : 0.0;
+            Vs[kv_row][kv_col] = ok ? V[gr * D + kv_col] : 0.0;
+        }
+        barrier();
+
+        // ---- Score computation: scores[t] = <qs, Ks[t]> * scale ----
+        // Threads 0..BC-1 each do one dot product. tid >= BC idles.
+        if (tid < BC) {
+            if (tid < block_len) {
+                float acc = 0.0;
+                for (uint d = 0; d < D; ++d) {
+                    acc = fma(qs[d], Ks[tid][d], acc);
+                }
+                scores[tid] = acc * p.scale;
+            } else {
+                scores[tid] = NEG_LARGE;   // masked
+            }
+        }
+        barrier();
+
+        // ---- Block max via tree reduction ----
+        sdata[tid] = (tid < BC) ? scores[tid] : NEG_LARGE;
+        barrier();
+        for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+            barrier();
+        }
+        const float m_block = sdata[0];
+
+        // ---- Online softmax update ----
+        const float m_new  = max(m_val, m_block);
+        const float alpha  = exp(m_val - m_new);   // rescale factor for old O, l
+        // Rewrite scores[] in place: p_j = exp(scores - m_new)
+        if (tid < BC) {
+            if (tid < block_len) {
+                scores[tid] = exp(scores[tid] - m_new);
+            } else {
+                scores[tid] = 0.0;                  // don't contribute
+            }
+        }
+        barrier();
+
+        // ---- Block sum reduction over scores[] ----
+        sdata[tid] = (tid < BC) ? scores[tid] : 0.0;
+        barrier();
+        for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sdata[tid] += sdata[tid + stride];
+            barrier();
+        }
+        const float block_sum = sdata[0];
+        const float l_new = alpha * l_val + block_sum;
+
+        // ---- O update: O = α * O + scores @ V_block ----
+        for (uint d = tid; d < D; d += WG) {
+            float pv = 0.0;
+            for (uint s = 0; s < BC; ++s) {
+                pv = fma(scores[s], Vs[s][d], pv);
+            }
+            os[d] = alpha * os[d] + pv;
+        }
+
+        // ---- Commit running state ----
+        // Only tid=0 writes; barrier() below makes it visible to all.
+        if (tid == 0) {
+            m_val = m_new;
+            l_val = l_new;
+        }
+        barrier();
+    }
+
+    // ---- Final normalize ----
+    const float inv_l = 1.0 / l_val;
+    for (uint d = tid; d < D; d += WG) {
+        O[q_idx * D + d] = os[d] * inv_l;
+    }
+}

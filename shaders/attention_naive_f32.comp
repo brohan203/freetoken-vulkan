@@ -1,0 +1,121 @@
+#version 450
+// attention_naive_f32.comp — fused single-head attention. FP32, causal-free.
+//
+// out = softmax(Q @ K^T * scale, dim=-1) @ V
+//
+// Shapes (per workgroup, one query at a time):
+//   Q: [S, D]     each workgroup owns query row Q[q_idx, :]
+//   K: [S, D]
+//   V: [S, D]
+//   out: [S, D]   this workgroup writes out[q_idx, :]
+//
+// Design constraint: the S-long score vector lives in SHARED MEMORY, so this
+// shader assumes S ≤ MAX_S. That's the "naive" — real FlashAttention blocks
+// S so it never needs to store the full row of scores, which is the whole
+// point (linear vs quadratic memory in S).
+//
+// KEY IDEAS THIS SHADER INTRODUCES:
+//
+// 1. Fusion. GEMM + softmax + GEMM all in one dispatch. No round-trip to
+//    global memory between the phases — scores live in LDS the whole time.
+//    This is why fused attention is faster than 3 separate kernels even at
+//    small S: 3× fewer global-memory streams.
+//
+// 2. In-place softmax on shared memory. Same max-subtract stability as
+//    softmax_f32.comp, but the input/output is `scores[]` in LDS rather
+//    than a global buffer. The reduction pattern is exactly the same.
+//
+// 3. Two work partitions in one workgroup. Phase 1 (score dot products)
+//    parallelizes over the S dimension — each thread does dot products for
+//    a strided subset of keys. Phase 3 (output) parallelizes over the D
+//    dimension — each thread produces a strided subset of output values.
+//    Same thread pool, different index maps.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufQ { float Q[]; };   // [S, D]
+layout(std430, binding = 1) readonly  buffer BufK { float K[]; };   // [S, D]
+layout(std430, binding = 2) readonly  buffer BufV { float V[]; };   // [S, D]
+layout(std430, binding = 3) writeonly buffer BufO { float O[]; };   // [S, D]
+
+layout(push_constant) uniform Params {
+    uint  S;
+    uint  D;
+    float scale;   // typically 1 / sqrt(D)
+} p;
+
+// Max supported S. 2048 floats = 8 KB LDS, well within budget on RDNA2.
+// Bigger S ⇒ FlashAttention.
+const uint MAX_S = 2048;
+
+shared float scores[MAX_S];      // per-query scores / attention weights
+shared float sdata[128];         // reduction scratch (matches WG size)
+
+const float NEG_LARGE = -3.4e38;
+
+void main() {
+    const uint q_idx = gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint WG    = gl_WorkGroupSize.x;    // 128
+    const uint S     = p.S;
+    const uint D     = p.D;
+
+    // ================================================================
+    // Phase 1: scores[s] = <Q[q_idx], K[s]> * scale   for each s in [0, S)
+    // Parallelization: threads round-robin over s.
+    // ================================================================
+    for (uint s = tid; s < S; s += WG) {
+        float dot = 0.0;
+        for (uint d = 0; d < D; ++d) {
+            dot = fma(Q[q_idx * D + d], K[s * D + d], dot);
+        }
+        scores[s] = dot * p.scale;
+    }
+    barrier();
+
+    // ================================================================
+    // Phase 2: numerically stable softmax over scores[] IN PLACE in LDS.
+    // ================================================================
+    // 2a: row max via tree reduction
+    float local_max = NEG_LARGE;
+    for (uint s = tid; s < S; s += WG) {
+        local_max = max(local_max, scores[s]);
+    }
+    sdata[tid] = local_max;
+    barrier();
+    for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        barrier();
+    }
+    const float smax = sdata[0];
+
+    // 2b: exp(scores - smax) → back into scores[], and sum
+    float local_sum = 0.0;
+    for (uint s = tid; s < S; s += WG) {
+        float e = exp(scores[s] - smax);
+        scores[s] = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    barrier();
+    for (uint stride = WG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        barrier();
+    }
+    const float inv_sum = 1.0 / sdata[0];
+
+    // Note: we defer the divide-by-sum to the final multiply below — one
+    // multiplication per output element instead of S more in this phase.
+
+    // ================================================================
+    // Phase 3: O[q_idx, d] = sum_s scores[s] * V[s, d] * inv_sum
+    // Parallelization: threads round-robin over d (the output dim).
+    // ================================================================
+    for (uint d = tid; d < D; d += WG) {
+        float acc = 0.0;
+        for (uint s = 0; s < S; ++s) {
+            acc = fma(scores[s], V[s * D + d], acc);
+        }
+        O[q_idx * D + d] = acc * inv_sum;
+    }
+}

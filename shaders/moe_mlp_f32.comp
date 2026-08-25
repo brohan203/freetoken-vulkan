@@ -1,0 +1,147 @@
+#version 450
+// moe_mlp_f32.comp — Fused MoE MLP forward. FP32.
+//
+// The FreeToken-shaped kernel. Given routed tokens and their K expert
+// assignments, computes:
+//
+//     y[t] = sum_{k=0..K-1}  weights[t,k] * expert_e[k]_mlp(x[t])
+//
+// where each expert's MLP is standard SwiGLU:
+//
+//     expert_e(x) = W_down[e] @ (silu(W_gate[e] @ x) * (W_up[e] @ x))
+//
+// Layout: one workgroup per token. All computation for a token happens in
+// one dispatch — no permute/unpermute round-trip. Simple but has known
+// limits (see SKIPPED.md #moe.grouped-gemm): for large Dff we'd need to
+// block along Dff to fit LDS, and per-token compute means we can't share
+// expert-weight reads across tokens routed to the same expert.
+//
+// KEY IDEAS:
+//
+// 1. Per-token routing baked into the kernel. `indices[t,k]` selects
+//    which expert weight matrix to read for each of K MLP passes. The
+//    expert weight tensor W_gate is laid out as [E, Dff, D] row-major,
+//    so W_gate[e, d, i] lives at offset (e * Dff + d) * D + i.
+//
+// 2. SwiGLU inline. No separate swiglu dispatch — we compute silu(g)*u
+//    directly on our LDS scratch. Overwrites g with the SwiGLU result to
+//    save one LDS array.
+//
+// 3. Weighted accumulation into a per-token output. Each of K expert
+//    passes writes into `acc[]`, scaled by `weights[t,k]`. Since router
+//    weights sum to 1 (post-renormalization), the sum is a proper
+//    convex combination.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufX       { float x[]; };        // [T, D]
+layout(std430, binding = 1) readonly  buffer BufIndices { uint  indices[]; };  // [T, K]
+layout(std430, binding = 2) readonly  buffer BufWeights { float weights[]; };  // [T, K]
+layout(std430, binding = 3) readonly  buffer BufWGate   { float W_gate[]; };   // [E, Dff, D]
+layout(std430, binding = 4) readonly  buffer BufWUp     { float W_up[]; };     // [E, Dff, D]
+layout(std430, binding = 5) readonly  buffer BufWDown   { float W_down[]; };   // [E, D, Dff]
+layout(std430, binding = 6) writeonly buffer BufY       { float y[]; };        // [T, D]
+
+layout(push_constant) uniform Params {
+    uint T;
+    uint D;
+    uint Dff;
+    uint E;
+    uint K;
+} p;
+
+// LDS budget (worst case D=256, Dff=512):
+//   xs[256]  = 1 KB
+//   gs[512]  = 2 KB   (holds gate output; overwritten to SwiGLU output)
+//   us[512]  = 2 KB
+//   acc[256] = 1 KB
+//   Total    = 6 KB. Plenty of headroom.
+// For larger D/Dff (real Phi-3.5-MoE = 4096/6400) we'd blow past 64 KB and
+// need to block along Dff. Tracked in SKIPPED.md.
+const uint MAX_D   = 256;
+const uint MAX_DFF = 512;
+const uint WG      = 128;
+
+shared float xs [MAX_D];    // input token
+shared float gs [MAX_DFF];  // gate output → overwritten with SwiGLU result
+shared float us [MAX_DFF];  // up output
+shared float acc[MAX_D];    // running weighted sum of expert outputs
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint D   = p.D;
+    const uint Dff = p.Dff;
+    const uint K   = p.K;
+
+    // ---- Load x[tok] into LDS once ----
+    for (uint d = tid; d < D; d += WG) xs[d]  = x[tok * D + d];
+    // ---- Zero accumulator ----
+    for (uint d = tid; d < D; d += WG) acc[d] = 0.0;
+    barrier();
+
+    // ============================================================
+    // For each of K experts assigned to this token
+    // ============================================================
+    for (uint k = 0; k < K; ++k) {
+        const uint  e = indices[tok * K + k];
+        const float w = weights[tok * K + k];
+
+        // ---- Compute gate: gs[d] = <W_gate[e, d, :], xs>, d in [0, Dff) ----
+        // Each thread handles Dff/WG output rows (each row is a D-length
+        // dot product). Row-major layout: W_gate[e, d, i] = ((e*Dff+d)*D+i).
+        for (uint d = tid; d < Dff; d += WG) {
+            float dot = 0.0;
+            uint  row_off = (e * Dff + d) * D;
+            for (uint i = 0; i < D; ++i) {
+                dot = fma(W_gate[row_off + i], xs[i], dot);
+            }
+            gs[d] = dot;
+        }
+
+        // ---- Compute up: us[d] = <W_up[e, d, :], xs> ----
+        for (uint d = tid; d < Dff; d += WG) {
+            float dot = 0.0;
+            uint  row_off = (e * Dff + d) * D;
+            for (uint i = 0; i < D; ++i) {
+                dot = fma(W_up[row_off + i], xs[i], dot);
+            }
+            us[d] = dot;
+        }
+        // No barrier needed between g and u writes — each thread only
+        // touches its own d (per-thread ordering) and the reads in the
+        // SwiGLU phase below stay within the same d slot per thread.
+
+        // ---- SwiGLU inline: gs[d] := silu(gs[d]) * us[d] ----
+        for (uint d = tid; d < Dff; d += WG) {
+            float g = gs[d];
+            float silu = g / (1.0 + exp(-g));
+            gs[d] = silu * us[d];
+        }
+        // Barrier here IS needed — the W_down phase below reads gs[]
+        // across all d values, i.e. cross-thread.
+        barrier();
+
+        // ---- Compute down + accumulate: acc[d] += w * <W_down[e, d, :], gs> ----
+        // W_down layout: [E, D, Dff], so W_down[e, d, i] = ((e*D+d)*Dff+i).
+        for (uint d = tid; d < D; d += WG) {
+            float dot = 0.0;
+            uint  row_off = (e * D + d) * Dff;
+            for (uint i = 0; i < Dff; ++i) {
+                dot = fma(W_down[row_off + i], gs[i], dot);
+            }
+            acc[d] = fma(w, dot, acc[d]);
+        }
+
+        // Barrier before next k iteration: next iter will overwrite gs/us,
+        // and while the acc-write above is per-thread strided (own d), any
+        // slower thread still finishing its acc line would race with the
+        // next iter's g writes if we don't sync.
+        barrier();
+    }
+
+    // ---- Write output ----
+    for (uint d = tid; d < D; d += WG) {
+        y[tok * D + d] = acc[d];
+    }
+}

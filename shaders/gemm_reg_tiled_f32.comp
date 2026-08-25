@@ -1,0 +1,143 @@
+#version 450
+// gemm_reg_tiled_f32.comp — LDS tile + per-thread register tile. C = A@B, FP32.
+//
+// Same problem, next level of optimization. In gemm_tiled_f32 every thread
+// computes one output element and the ratio of FMA:LDS-load is ~1:1. That
+// leaves the ALU idle waiting for LDS. Here each thread computes a TM×TN
+// register mini-tile (4×4 = 16 outputs), which lifts the FMA:LDS-load ratio
+// to (TM*TN) : (TM+TN) — with TM=TN=4 that's 16:8 = 2:1.
+//
+// KEY IDEAS THIS SHADER INTRODUCES:
+//
+// 1. Register tiling. Each thread keeps a private accumulator array
+//    `acc[TM][TN]` in registers. RDNA2 has ~256 VGPRs per lane — TM*TN=16
+//    accumulators + a few staging registers is nowhere near the ceiling.
+//
+// 2. Cooperative loading with linear tile IDs. The LDS tiles are now
+//    BM=64 × BK=8 and BK=8 × BN=64. That's 512 floats each. Only 256
+//    threads in the workgroup, so each thread loads 2 A elements + 2 B
+//    elements per outer step. We index them by "linear-slot in the tile"
+//    rather than the previous "one-slot-per-thread" trick.
+//
+// 3. Register pre-loads inside the k-loop. Before the TM*TN=16 FMAs for
+//    a given k, we load TM values of A and TN values of B into scalar
+//    regs. Compiler unrolls the inner loops fully (TM, TN are const).
+//
+// KNOWN LIMITATIONS (left for later phases):
+//   - No double-buffering: we still `barrier()` twice per K-strip. A next
+//     step would overlap "load tile t+1 into LDS half B" while "computing
+//     tile t from LDS half A".
+//   - No subgroup / matrix-core ops. This is pure FP32 scalar FMA.
+//   - Bank conflicts on the LDS tile might exist; not measured yet.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufA { float A[]; };   // [M, K]
+layout(std430, binding = 1) readonly  buffer BufB { float B[]; };   // [K, N]
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };   // [M, N]
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+const uint WG_X = 16;                    // threads along n
+const uint WG_Y = 16;                    // threads along m
+const uint TM   = 4;                     // outputs per thread along m
+const uint TN   = 4;                     // outputs per thread along n
+const uint BM   = WG_Y * TM;             // 64 rows of C per workgroup
+const uint BN   = WG_X * TN;             // 64 cols of C per workgroup
+const uint BK   = 8;                     // K-strip width
+
+// LDS tiles. 64*8*4 = 2 KB each, 4 KB total. Well within 64 KB LDS/CU.
+shared float As[BM][BK];
+shared float Bs[BK][BN];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;    // 0..15
+    const uint ty = gl_LocalInvocationID.y;    // 0..15
+    const uint tid = ty * WG_X + tx;           // 0..255 linear slot in wg
+    const uint wg_m0 = gl_WorkGroupID.y * BM;  // top row of C this wg owns
+    const uint wg_n0 = gl_WorkGroupID.x * BN;  // left col of C this wg owns
+
+    // Each thread owns a TM×TN sub-block of C at (wg_m0 + ty*TM, wg_n0 + tx*TN)
+    const uint m0 = wg_m0 + ty * TM;
+    const uint n0 = wg_n0 + tx * TN;
+
+    float acc[TM][TN];
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < TN; ++j)
+            acc[i][j] = 0.0;
+
+    const uint num_tiles = (p.K + BK - 1) / BK;
+
+    // Each thread loads (BM*BK + BK*BN)/256 = (512+512)/256 = 4 elements
+    // per K-strip (2 A, 2 B).
+    const uint LOAD_A_PER_THREAD = (BM * BK) / (WG_X * WG_Y);   // 2
+    const uint LOAD_B_PER_THREAD = (BK * BN) / (WG_X * WG_Y);   // 2
+
+    for (uint t = 0; t < num_tiles; ++t) {
+        const uint k0 = t * BK;
+
+        // ---- Cooperatively load A[wg_m0 .. wg_m0+BM, k0 .. k0+BK] into As ----
+        // Elements laid out row-major in the tile (row * BK + col).
+        // Adjacent threads write adjacent LDS slots, so LDS write coalescing
+        // is fine; the read of global A on any given step is:
+        //   src = A[(wg_m0 + row) * K + (k0 + col)]
+        // With tid = ty*16 + tx, the two elements for this thread are at
+        // slot = tid and slot = tid + 256. For slot = tid:
+        //   row = tid / BK   col = tid % BK
+        // Adjacent tx (tid) → adjacent (row * BK + col) → adjacent (row, col+1)
+        // → adjacent global address in K. Coalesced.
+        for (uint i = 0; i < LOAD_A_PER_THREAD; ++i) {
+            const uint slot = tid + i * (WG_X * WG_Y);   // 0..511
+            const uint row  = slot / BK;
+            const uint col  = slot % BK;
+            const uint gm   = wg_m0 + row;
+            const uint gk   = k0 + col;
+            As[row][col] = (gm < p.M && gk < p.K) ? A[gm * p.K + gk] : 0.0;
+        }
+
+        // ---- Cooperatively load B[k0 .. k0+BK, wg_n0 .. wg_n0+BN] into Bs ----
+        for (uint i = 0; i < LOAD_B_PER_THREAD; ++i) {
+            const uint slot = tid + i * (WG_X * WG_Y);   // 0..511
+            const uint row  = slot / BN;                 // 0..7
+            const uint col  = slot % BN;                 // 0..63
+            const uint gk   = k0 + row;
+            const uint gn   = wg_n0 + col;
+            Bs[row][col] = (gk < p.K && gn < p.N) ? B[gk * p.N + gn] : 0.0;
+        }
+
+        barrier();
+
+        // ---- Inner k-loop with register pre-load ----
+        // For each k in the strip, load our TM rows of A and TN cols of B
+        // into scalar registers, then do TM*TN FMAs. Compiler unrolls this
+        // fully (TM, TN, BK are const uints), turning it into a flat
+        // sequence of ~128 FMAs per K-strip with no data-dependent branches.
+        for (uint k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            float b_reg[TN];
+            for (uint i = 0; i < TM; ++i) a_reg[i] = As[ty * TM + i][k];
+            for (uint j = 0; j < TN; ++j) b_reg[j] = Bs[k][tx * TN + j];
+            for (uint i = 0; i < TM; ++i) {
+                for (uint j = 0; j < TN; ++j) {
+                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // ---- Write back the register tile ----
+    for (uint i = 0; i < TM; ++i) {
+        const uint gm = m0 + i;
+        if (gm >= p.M) continue;
+        for (uint j = 0; j < TN; ++j) {
+            const uint gn = n0 + j;
+            if (gn < p.N) C[gm * p.N + gn] = acc[i][j];
+        }
+    }
+}

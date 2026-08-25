@@ -1,0 +1,29 @@
+#version 450
+// vector_add.comp — the "hello, GPU" of Vulkan compute.
+//
+// One workgroup dimension. Each invocation reads one element from A and B,
+// adds them, writes to C. That's it. The point of this shader is not the math —
+// it's proving the whole pipeline (SPIR-V compile → descriptor set → dispatch
+// → memory sync → readback) actually works on your GPU.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// std430 = tightly packed, no padding between array elements. Standard for
+// storage buffers in compute shaders.
+layout(std430, binding = 0) readonly  buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly  buffer BufB { float b[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float c[]; };
+
+// Push constant: total element count. Passed on every dispatch, not stored in
+// a buffer. Small, fast, exactly right for kernel arguments.
+layout(push_constant) uniform Params {
+    uint n;
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    // Guard against overshoot: we dispatch ceil(n/256) workgroups, so the
+    // last workgroup may have invocations past the end of the array.
+    if (gid >= params.n) return;
+    c[gid] = a[gid] + b[gid];
+}

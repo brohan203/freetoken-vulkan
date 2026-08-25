@@ -1,0 +1,124 @@
+#version 450
+// gemm_reg_tiled_f16.comp — LDS + register tiled GEMM with FP16 storage
+// and FP32 accumulator. Same algorithm as gemm_reg_tiled_f32.comp.
+//
+// Why mixed precision:
+// - FP16 storage halves the memory bandwidth cost of loading A, B, C.
+//   On memory-bound kernels (which our GEMM largely is at 1024^3), this
+//   is close to a straight 2× win.
+// - FP16 storage also halves the LDS pressure — we could double BM/BN
+//   to increase compute intensity, though this version keeps BM=BN=64
+//   to make the FP16-vs-FP32 delta apples-to-apples.
+// - FP32 accumulator preserves numerical precision: FP16 accumulation
+//   over K=1024 elements would accumulate ~1e-2 error per output,
+//   completely unusable for LLM inference. Mixed precision is the
+//   industry-standard pattern (cuBLAS, rocBLAS, hipBLAS all do this).
+//
+// Requires shaderFloat16 + storageBuffer16BitAccess Vulkan features
+// (enabled in vk_util.hpp create_context).
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// FP16 storage: 2 bytes per element instead of 4. Half the memory bandwidth
+// for the same shape.
+layout(std430, binding = 0) readonly  buffer BufA { float16_t A[]; };   // [M, K]
+layout(std430, binding = 1) readonly  buffer BufB { float16_t B[]; };   // [K, N]
+layout(std430, binding = 2) writeonly buffer BufC { float16_t C[]; };   // [M, N]
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+const uint WG_X = 16;
+const uint WG_Y = 16;
+const uint TM   = 4;
+const uint TN   = 4;
+const uint BM   = WG_Y * TM;    // 64
+const uint BN   = WG_X * TN;    // 64
+const uint BK   = 8;
+
+// LDS: same layout as F32 version, but 2 bytes/element → 1 KB per tile
+// instead of 2 KB. Frees LDS budget for larger tiles in a follow-up.
+shared float16_t As[BM][BK];
+shared float16_t Bs[BK][BN];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;
+    const uint ty = gl_LocalInvocationID.y;
+    const uint tid = ty * WG_X + tx;
+    const uint wg_m0 = gl_WorkGroupID.y * BM;
+    const uint wg_n0 = gl_WorkGroupID.x * BN;
+
+    const uint m0 = wg_m0 + ty * TM;
+    const uint n0 = wg_n0 + tx * TN;
+
+    // Accumulator lives in FP32 registers. Even though inputs are FP16,
+    // multiplication happens at FP32 precision (compiler promotes) and
+    // the accumulator preserves K products' worth of precision.
+    float acc[TM][TN];
+    for (uint i = 0; i < TM; ++i)
+        for (uint j = 0; j < TN; ++j)
+            acc[i][j] = 0.0;
+
+    const uint num_tiles = (p.K + BK - 1) / BK;
+    const uint LOAD_A_PER_THREAD = (BM * BK) / (WG_X * WG_Y);   // 2
+    const uint LOAD_B_PER_THREAD = (BK * BN) / (WG_X * WG_Y);   // 2
+
+    for (uint t = 0; t < num_tiles; ++t) {
+        const uint k0 = t * BK;
+
+        for (uint i = 0; i < LOAD_A_PER_THREAD; ++i) {
+            const uint slot = tid + i * (WG_X * WG_Y);
+            const uint row  = slot / BK;
+            const uint col  = slot % BK;
+            const uint gm   = wg_m0 + row;
+            const uint gk   = k0 + col;
+            As[row][col] = (gm < p.M && gk < p.K)
+                ? A[gm * p.K + gk] : float16_t(0.0);
+        }
+        for (uint i = 0; i < LOAD_B_PER_THREAD; ++i) {
+            const uint slot = tid + i * (WG_X * WG_Y);
+            const uint row  = slot / BN;
+            const uint col  = slot % BN;
+            const uint gk   = k0 + row;
+            const uint gn   = wg_n0 + col;
+            Bs[row][col] = (gk < p.K && gn < p.N)
+                ? B[gk * p.N + gn] : float16_t(0.0);
+        }
+
+        barrier();
+
+        // Inner k-loop. Read FP16 from LDS, promote to FP32 for FMA.
+        // Compiler on RDNA2 typically compiles float(fp16)*float(fp16)
+        // as an FMA with fp16 inputs and fp32 output — a single V_FMA_F32
+        // op that takes fp16 operands.
+        for (uint k = 0; k < BK; ++k) {
+            float a_reg[TM];
+            float b_reg[TN];
+            for (uint i = 0; i < TM; ++i) a_reg[i] = float(As[ty * TM + i][k]);
+            for (uint j = 0; j < TN; ++j) b_reg[j] = float(Bs[k][tx * TN + j]);
+            for (uint i = 0; i < TM; ++i) {
+                for (uint j = 0; j < TN; ++j) {
+                    acc[i][j] = fma(a_reg[i], b_reg[j], acc[i][j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write back — down-convert FP32 accumulator to FP16 for output storage.
+    for (uint i = 0; i < TM; ++i) {
+        const uint gm = m0 + i;
+        if (gm >= p.M) continue;
+        for (uint j = 0; j < TN; ++j) {
+            const uint gn = n0 + j;
+            if (gn < p.N) C[gm * p.N + gn] = float16_t(acc[i][j]);
+        }
+    }
+}

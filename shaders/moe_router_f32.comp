@@ -1,0 +1,121 @@
+#version 450
+// moe_router_f32.comp — top-K softmax router for MoE.
+//
+// Input:  logits [T, E]     — raw router logits per token
+// Output: indices [T, K]    — top-K expert IDs (uint32)
+//         weights [T, K]    — softmax weights, renormalized to sum=1
+//
+// Standard sparse-gate MoE routing (Shazeer et al 2017 / Fedus et al 2022):
+//
+//   probs = softmax(logits, dim=-1)
+//   top_k = argmax_K(probs)
+//   weights = probs[top_k] / probs[top_k].sum()   (renormalize)
+//
+// Design decisions:
+//
+// 1. One workgroup per token. Router is a per-token op; adjacent tokens
+//    are independent so there's no cross-token reduction to worry about.
+//    Total workgroups = T (batch × seq).
+//
+// 2. Small E. Router expert count is always small (Phi-3.5-MoE: 16,
+//    Mixtral 8x7B: 8, DeepSeek: 128). We assume E <= MAX_E = 128 and
+//    dispatch WG = MAX_E threads. Each thread owns one expert.
+//
+// 3. Top-K via K linear passes. K is small (1-8). Simplest correct
+//    approach: on each of K iterations, find the current argmax and mask
+//    it out. O(E*K) total, fine for K <= 8.
+//
+// 4. Weights are RENORMALIZED after top-K selection. Standard practice —
+//    if top-1 has prob 0.4 and top-2 has 0.2, we send weights [0.667,
+//    0.333] to experts so they combine to 1.0 in the final sum.
+
+const uint MAX_E = 128;
+const uint MAX_K = 8;
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufLogits  { float logits[]; };  // [T, E]
+layout(std430, binding = 1) writeonly buffer BufIndices { uint  indices[]; }; // [T, K]
+layout(std430, binding = 2) writeonly buffer BufWeights { float weights[]; }; // [T, K]
+
+layout(push_constant) uniform Params {
+    uint E;   // number of experts (1..MAX_E)
+    uint K;   // top-K (1..MAX_K)
+} p;
+
+shared float probs[MAX_E];       // softmax probs, one slot per expert
+shared uint  chosen_idx[MAX_K];  // top-K expert indices
+shared float chosen_val[MAX_K];  // top-K expert probs
+shared float sdata[MAX_E];       // reduction scratch
+
+const float NEG_LARGE = -3.4e38;
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint WG  = gl_WorkGroupSize.x;
+    const uint E   = p.E;
+    const uint K   = p.K;
+
+    // ==== Load logits into probs[] (each thread owns one expert slot) ====
+    if (tid < E) probs[tid] = logits[tok * E + tid];
+    else if (tid < MAX_E) probs[tid] = NEG_LARGE;  // pad with -inf for max
+    barrier();
+
+    // ==== Softmax over E logits ====
+    // Max reduction across the first MAX_E slots.
+    sdata[tid] = probs[tid];
+    barrier();
+    for (uint stride = MAX_E / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = max(sdata[tid], sdata[tid + stride]);
+        barrier();
+    }
+    const float pmax = sdata[0];
+
+    // exp(logit - max)
+    if (tid < E) probs[tid] = exp(probs[tid] - pmax);
+    else if (tid < MAX_E) probs[tid] = 0.0;
+    barrier();
+
+    // Sum reduction
+    sdata[tid] = probs[tid];
+    barrier();
+    for (uint stride = MAX_E / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        barrier();
+    }
+    const float inv_sum = 1.0 / sdata[0];
+
+    // Normalize probs
+    if (tid < MAX_E) probs[tid] = probs[tid] * inv_sum;
+    barrier();
+
+    // ==== Top-K selection ====
+    // On each of K iterations, tid=0 scans probs[] to find the current max
+    // and masks it. K small (<= 8) so serial is fine — parallel top-K adds
+    // significant complexity for minimal wins here.
+    if (tid == 0) {
+        for (uint k = 0; k < K; ++k) {
+            float best_v = NEG_LARGE;
+            uint  best_i = 0;
+            for (uint e = 0; e < E; ++e) {
+                if (probs[e] > best_v) { best_v = probs[e]; best_i = e; }
+            }
+            chosen_idx[k] = best_i;
+            chosen_val[k] = best_v;
+            probs[best_i] = NEG_LARGE;   // mask so next iter finds next-best
+        }
+    }
+    barrier();
+
+    // ==== Renormalize chosen weights to sum = 1 ====
+    if (tid == 0) {
+        float s = 0.0;
+        for (uint k = 0; k < K; ++k) s += chosen_val[k];
+        float inv_s = 1.0 / s;
+        for (uint k = 0; k < K; ++k) {
+            indices[tok * K + k] = chosen_idx[k];
+            weights[tok * K + k] = chosen_val[k] * inv_s;
+        }
+    }
+}

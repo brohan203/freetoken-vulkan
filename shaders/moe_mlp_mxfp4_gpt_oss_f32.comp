@@ -1,0 +1,225 @@
+#version 450
+// moe_mlp_mxfp4_gpt_oss_f32.comp — gpt-oss MoE MLP with MXFP4 expert weights.
+//
+// Implements the exact forward pass of transformers.GptOssExperts:
+//
+//   for each expert k in top-K assigned to token t:
+//     gate_up[j] = <W_gate_up[e][j, :], x[t]> + bias_gate_up[e][j]    for j in [0, 2*Dff)
+//     gate[i]    = gate_up[2*i]         (INTERLEAVED — even indices are gate)
+//     up[i]      = gate_up[2*i + 1]     (odd indices are up)
+//     gate       = min(gate, +LIMIT)                 (asymmetric clamp)
+//     up         = clamp(up, -LIMIT, +LIMIT)
+//     glu        = gate * sigmoid(gate * ALPHA)      (ALPHA=1.702)
+//     hidden[i]  = (up + 1) * glu[i]                 (note the "+1"!)
+//     down_out   = <W_down[e][d, :], hidden> + bias_down[e][d]  for d in [0, D)
+//     y[t][d]   += weight_k * down_out[d]
+//
+// Both W_gate_up and W_down are MXFP4-quantized. Biases are FP32.
+//
+// Weight tensor layouts (matches gpt-oss safetensors pre-transpose form):
+//   gate_up_blocks:  [E, 2*Dff, NB_D,   16]  uint8    (NB_D   = D  /32)
+//   gate_up_scales:  [E, 2*Dff, NB_D]        uint8
+//   gate_up_bias:    [E, 2*Dff]              float32
+//   down_blocks:     [E, D,     NB_Dff, 16]  uint8    (NB_Dff = Dff/32)
+//   down_scales:     [E, D,     NB_Dff]      uint8
+//   down_bias:       [E, D]                  float32
+//
+// Dispatch: one workgroup per token (T along X). WG = 128 threads.
+// LDS budget at D=Dff=2880:
+//   xs[2880]     11 520 B
+//   acc[2880]    11 520 B
+//   gate_chunk[64] 256 B
+//   up_chunk  [64] 256 B
+//   hidden_chunk[64] 256 B
+//   Total       ~23.9 KB   → fits 64 KB LDS/CU with headroom for occupancy.
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufGUBlocks { uint8_t gu_blocks[]; }; // [E, 2*Dff, NB_D, 16]
+layout(std430, binding = 1) readonly  buffer BufGUScales { uint8_t gu_scales[]; }; // [E, 2*Dff, NB_D]
+layout(std430, binding = 2) readonly  buffer BufGUBias   { float   gu_bias[]; };   // [E, 2*Dff]
+layout(std430, binding = 3) readonly  buffer BufDBlocks  { uint8_t d_blocks[]; };  // [E, D, NB_Dff, 16]
+layout(std430, binding = 4) readonly  buffer BufDScales  { uint8_t d_scales[]; };  // [E, D, NB_Dff]
+layout(std430, binding = 5) readonly  buffer BufDBias    { float   d_bias[]; };    // [E, D]
+layout(std430, binding = 6) readonly  buffer BufX        { float   x[]; };         // [T, D]
+layout(std430, binding = 7) readonly  buffer BufIndices  { uint    indices[]; };   // [T, K]
+layout(std430, binding = 8) readonly  buffer BufWeights  { float   weights[]; };   // [T, K]
+layout(std430, binding = 9) writeonly buffer BufY        { float   y[]; };         // [T, D]
+
+layout(push_constant) uniform Params {
+    uint T;
+    uint D;
+    uint Dff;
+    uint E;
+    uint K;
+} p;
+
+const uint MAX_D  = 2880;
+const uint BDFF   = 64;             // hidden values per Dff chunk
+const uint WG     = 128;            // workgroup size
+
+const float ALPHA = 1.702;
+const float LIMIT = 7.0;
+
+const float FP4_LUT[16] = float[](
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+shared float xs           [MAX_D];   // token input
+shared float acc          [MAX_D];   // running weighted output
+shared float gate_chunk   [BDFF];    // per-chunk gate values
+shared float up_chunk     [BDFF];    // per-chunk up values
+shared float hidden_chunk [BDFF];    // activated (gate,up) → hidden
+
+// ---- MXFP4 matvec for one row of gate_up_proj[e], row = target_row ----
+// Returns <W_gate_up[e][target_row, :], xs> summed over all K=D elements.
+// Uses xs[] from LDS as the activation vector.
+float matvec_gu_row(uint e, uint target_row, uint D, uint NB_D) {
+    // Row starts at:
+    //   blocks offset: (e * 2*Dff + target_row) * NB_D * 16
+    //   scales offset: (e * 2*Dff + target_row) * NB_D
+    // But we don't know 2*Dff at compile time; store base row offset instead.
+    // Caller supplies it as `target_row` in the [0, 2*Dff) index space, so:
+    //   Actually — we recompute the base using D and 2*Dff, but 2*Dff = 2*p.Dff.
+    uint two_Dff = 2u * p.Dff;
+    uint blocks_row_off = (e * two_Dff + target_row) * NB_D * 16u;
+    uint scales_row_off = (e * two_Dff + target_row) * NB_D;
+
+    float acc_v = 0.0;
+    for (uint b = 0; b < NB_D; ++b) {
+        uint scale_byte = uint(gu_scales[scales_row_off + b]);
+        float scale = uintBitsToFloat(scale_byte << 23);
+        uint block_off = blocks_row_off + b * 16u;
+        uint x_off = b * 32u;
+        for (uint bi = 0; bi < 16; ++bi) {
+            uint packed = uint(gu_blocks[block_off + bi]);
+            uint lo = packed & 0x0Fu;
+            uint hi = (packed >> 4) & 0x0Fu;
+            float w_lo = FP4_LUT[lo] * scale;
+            float w_hi = FP4_LUT[hi] * scale;
+            acc_v = fma(w_lo, xs[x_off + bi * 2 + 0u], acc_v);
+            acc_v = fma(w_hi, xs[x_off + bi * 2 + 1u], acc_v);
+        }
+    }
+    return acc_v;
+}
+
+// Contribution to down_proj row `target_row` from the current hidden_chunk.
+// dff_start: which BDFF-sized chunk of the Dff K-dim we're processing.
+// Assumes BDFF == 64 == 2 * MXFP4 block_size, so we consume exactly 2 blocks
+// from the down MXFP4 blocks for this chunk.
+float matvec_d_row_chunk(uint e, uint target_row, uint dff_start, uint NB_Dff) {
+    uint blocks_row_off = (e * p.D + target_row) * NB_Dff * 16u;
+    uint scales_row_off = (e * p.D + target_row) * NB_Dff;
+
+    // BDFF = 64 so exactly 2 MXFP4 blocks (each 32 K-elements).
+    uint first_block = dff_start / 32u;
+
+    float acc_v = 0.0;
+    for (uint bb = 0; bb < 2; ++bb) {                   // 2 blocks × 32 elems = 64
+        uint b = first_block + bb;
+        uint scale_byte = uint(d_scales[scales_row_off + b]);
+        float scale = uintBitsToFloat(scale_byte << 23);
+        uint block_off = blocks_row_off + b * 16u;
+        for (uint bi = 0; bi < 16; ++bi) {
+            uint packed = uint(d_blocks[block_off + bi]);
+            uint lo = packed & 0x0Fu;
+            uint hi = (packed >> 4) & 0x0Fu;
+            float w_lo = FP4_LUT[lo] * scale;
+            float w_hi = FP4_LUT[hi] * scale;
+            // hidden_chunk local index: bb * 32 + bi * 2 + 0/1
+            uint h0 = bb * 32u + bi * 2u + 0u;
+            uint h1 = bb * 32u + bi * 2u + 1u;
+            acc_v = fma(w_lo, hidden_chunk[h0], acc_v);
+            acc_v = fma(w_hi, hidden_chunk[h1], acc_v);
+        }
+    }
+    return acc_v;
+}
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint D   = p.D;
+    const uint Dff = p.Dff;
+    const uint K   = p.K;
+    const uint NB_D   = D   / 32u;
+    const uint NB_Dff = Dff / 32u;
+
+    // Load token input; init accumulator.
+    for (uint d = tid; d < D; d += WG) xs[d]  = x[tok * D + d];
+    for (uint d = tid; d < D; d += WG) acc[d] = 0.0;
+    barrier();
+
+    // Loop over K experts assigned to this token.
+    for (uint k = 0; k < K; ++k) {
+        const uint  e = indices[tok * K + k];
+        const float w = weights[tok * K + k];
+
+        // Process Dff in chunks of BDFF hidden values.
+        const uint num_chunks = (Dff + BDFF - 1u) / BDFF;
+        for (uint c = 0; c < num_chunks; ++c) {
+            const uint dff_start = c * BDFF;
+
+            // ---- Gate/Up phase ----
+            // Threads 0..BDFF-1 compute gate_chunk[tid] = W[e, 2*(dff_start+tid), :] · xs
+            // Threads BDFF..2*BDFF-1 compute up_chunk[tid-BDFF]
+            // = W[e, 2*(dff_start + tid-BDFF)+1, :] · xs
+            if (tid < BDFF) {
+                uint i = tid;
+                uint row = 2u * (dff_start + i);
+                if (dff_start + i < Dff) {
+                    float v = matvec_gu_row(e, row, D, NB_D);
+                    v += gu_bias[e * 2u * Dff + row];
+                    gate_chunk[i] = v;
+                } else {
+                    gate_chunk[i] = 0.0;
+                }
+            } else if (tid < 2u * BDFF) {
+                uint i = tid - BDFF;
+                uint row = 2u * (dff_start + i) + 1u;
+                if (dff_start + i < Dff) {
+                    float v = matvec_gu_row(e, row, D, NB_D);
+                    v += gu_bias[e * 2u * Dff + row];
+                    up_chunk[i] = v;
+                } else {
+                    up_chunk[i] = 0.0;
+                }
+            }
+            barrier();
+
+            // ---- Activation phase: (up + 1) * gate * sigmoid(gate * ALPHA) ----
+            if (tid < BDFF && dff_start + tid < Dff) {
+                float g = min(gate_chunk[tid], LIMIT);
+                float u = clamp(up_chunk[tid], -LIMIT, LIMIT);
+                float glu = g * (1.0 / (1.0 + exp(-g * ALPHA)));   // g * sigmoid(g*ALPHA)
+                hidden_chunk[tid] = (u + 1.0) * glu;
+            } else if (tid < BDFF) {
+                hidden_chunk[tid] = 0.0;
+            }
+            barrier();
+
+            // ---- Down phase: acc[d] += w * <W_down[e][d, chunk], hidden_chunk> ----
+            for (uint d = tid; d < D; d += WG) {
+                float contribution = matvec_d_row_chunk(e, d, dff_start, NB_Dff);
+                acc[d] = fma(w, contribution, acc[d]);
+            }
+            barrier();
+        }
+
+        // ---- Add down bias once per expert (weighted by router weight) ----
+        for (uint d = tid; d < D; d += WG) {
+            acc[d] = fma(w, d_bias[e * D + d], acc[d]);
+        }
+        barrier();
+    }
+
+    // Write output.
+    for (uint d = tid; d < D; d += WG) {
+        y[tok * D + d] = acc[d];
+    }
+}
