@@ -25,10 +25,42 @@ class Qwen3Model:
         self.embed_tokens = self.tensors.get("model.embed_tokens.weight")
         self.final_norm = _to_fp32(self.tensors.get("model.norm.weight"))
         self.layer_times: list[float] = []
+        self.resident_weights = None
 
     @classmethod
     def from_pretrained(cls, ext, model_dir: str | pathlib.Path) -> "Qwen3Model":
         return cls(ext, model_dir)
+
+    def pin_to_vram(self, verbose: bool = True) -> None:
+        """Pin all Qwen3 weights using native BF16 matrices."""
+        if self.resident_weights is not None:
+            return
+        from .resident import ResidentQwen3Weights
+
+        resident = ResidentQwen3Weights(self.ext)
+        resident.pin_global(self.embed_tokens, self.final_norm)
+        started = time.time()
+        for layer_idx in range(self.config.num_hidden_layers):
+            weights = load_qwen3_layer(self.tensors, layer_idx)
+            resident.append(weights)
+            del weights
+            if verbose and (layer_idx + 1) % 6 == 0:
+                gib = self.ext.resident_bytes_total() / 1024**3
+                print(
+                    f"  [Qwen3 resident {layer_idx+1}/{self.config.num_hidden_layers}] "
+                    f"{gib:.2f} GiB"
+                )
+        self.resident_weights = resident
+        if verbose:
+            print(
+                f"[Qwen3 resident] pinned in {time.time()-started:.1f}s; "
+                f"{self.ext.resident_bytes_total()/1024**3:.2f} GiB"
+            )
+
+    def close(self) -> None:
+        if self.resident_weights is not None:
+            self.resident_weights.free()
+            self.resident_weights = None
 
     def make_kv_cache(
         self, max_seqlen: int = 1024, batch: int = 1

@@ -35,6 +35,18 @@ class ResidentQwen3Weights:
     def __init__(self, ext):
         self.ext = ext
         self.layers: list[ResidentQwen3LayerWeights] = []
+        self.embed_tokens: int | None = None
+        self.final_norm: int | None = None
+
+    def pin_global(self, embed_tokens: torch.Tensor, final_norm: torch.Tensor) -> None:
+        if self.embed_tokens is not None or self.final_norm is not None:
+            raise RuntimeError("Qwen3 global weights already pinned")
+        self.embed_tokens = self.ext.upload_resident(
+            embed_tokens.bfloat16().contiguous()
+        )
+        self.final_norm = self.ext.upload_resident(
+            final_norm.float().contiguous()
+        )
 
     def append(self, weights: DenseDecoderLayerWeights) -> ResidentQwen3LayerWeights:
         if weights.q_norm is None or weights.k_norm is None:
@@ -61,6 +73,12 @@ class ResidentQwen3Weights:
             for handle in layer.handles():
                 self.ext.free_resident(handle)
         self.layers.clear()
+        if self.embed_tokens is not None:
+            self.ext.free_resident(self.embed_tokens)
+            self.embed_tokens = None
+        if self.final_norm is not None:
+            self.ext.free_resident(self.final_norm)
+            self.final_norm = None
 
 
 class ResidentQwen3Workspace:
@@ -94,6 +112,8 @@ class ResidentQwen3Workspace:
         self.up = empty((1, ff))
         self.activated = empty((1, ff))
         self.mlp_output = empty((1, d))
+        self.final_normalized = empty((1, d))
+        self.final_logits = empty((1, config.vocab_size))
         self.cos = empty((1, config.head_dim))
         self.sin = empty((1, config.head_dim))
         self.sinks = empty((config.num_attention_heads,))
@@ -173,3 +193,41 @@ def resident_qwen3_layer(
     ext.linear_bf16_resident_io(workspace.activated.handle, weights.down_weight, 0, workspace.mlp_output.handle, 1, d, cfg.intermediate_size, False)
     ext.add_resident(workspace.residual.handle, workspace.mlp_output.handle, out.handle, d)
     return output_slot
+
+
+@torch.no_grad()
+def resident_qwen3_model_step(model, workspace: ResidentQwen3Workspace, token_id: int, position: int) -> torch.Tensor:
+    """Run one fully resident Qwen3 token and return CPU FP32 logits."""
+    from .rope import compute_rope
+
+    resident = model.resident_weights
+    if resident is None or resident.embed_tokens is None or resident.final_norm is None:
+        raise RuntimeError("pin Qwen3 weights before resident decode")
+    if len(resident.layers) != model.config.num_hidden_layers:
+        raise RuntimeError("not all Qwen3 layers are resident")
+    embedding = model.embed_tokens[int(token_id)].float().reshape(1, -1)
+    cos, sin = compute_rope(model.config, torch.tensor([position]))
+    slot = workspace.upload_input(embedding, cos, sin)
+    for layer_idx, weights in enumerate(resident.layers):
+        slot = resident_qwen3_layer(
+            model.ext, workspace, weights, layer_idx, slot, position
+        )
+    workspace.ext.rmsnorm_resident(
+        workspace.hidden[slot].handle,
+        resident.final_norm,
+        workspace.final_normalized.handle,
+        1,
+        model.config.hidden_size,
+        model.config.rms_norm_eps,
+    )
+    workspace.ext.linear_bf16_resident_io(
+        workspace.final_normalized.handle,
+        resident.embed_tokens,
+        0,
+        workspace.final_logits.handle,
+        1,
+        model.config.vocab_size,
+        model.config.hidden_size,
+        False,
+    )
+    return workspace.final_logits.download()

@@ -166,10 +166,39 @@ A real layer-0 decode step compared with the verified cached path produced:
 - one-layer weights/workspace/KV resident allocation: `206,841,984` bytes
 - resident bytes after explicit free: exactly zero
 
+## Fully resident model and generation
+
+All Qwen3-4B weights now remain resident:
+
+- native BF16 embeddings and dense matrices
+- FP32 RMSNorm vectors
+- native BF16 tied LM head
+- FP32 activations, KV cache, attention, and logits
+
+The complete model plus a max-sequence-64 workspace uses
+`8,065,071,744` resident bytes (about 7.51 GiB).
+
+Eight-token generation remains exactly token-identical to Transformers:
+
+```text
+The capital of France is Paris. The capital of Germany is Berlin
+```
+
+Measured resident performance:
+
+- model pin time in the validated warm run: `6.10 s`
+- complete five-token prompt plus eight generated tokens: `0.975 s`
+- prompt processing: `0.0820 s/token`
+- decode: `0.0798 s/token` (about 12.5 tokens/second)
+- resident allocation unchanged before/after generation
+- explicit workspace/model cleanup returns resident bytes exactly to zero
+
+This is approximately 27x faster per decode token than the lazy correctness
+path (`2.20 s/token`).
+
 ## Next gates
 
-1. Pin all 36 Qwen3 layers in native BF16.
-2. Add resident final norm and tied LM head.
-3. Compare resident full-model decode against verified generation.
-4. Add sustained-generation stability tests.
-5. Add a Qwen3 CLI after resident decode is verified.
+1. Add sustained-generation stability tests.
+2. Add a Qwen3 CLI.
+3. Fuse resident dense-layer submissions for additional decode throughput.
+4. Benchmark longer contexts and workspace capacities.
