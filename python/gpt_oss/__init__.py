@@ -13,6 +13,7 @@ from .loader import (
     load_model,
 )
 from .model import GptOssModel
+from .generate_resident import greedy_generate_resident
 from .resident import ResidentLayerHandles, ResidentMoEWeights
 from .resident_tensor import ResidentTensor
 from .resident_projections import (
@@ -34,6 +35,7 @@ __all__ = [
     "load_layer",
     "load_model",
     "GptOssModel",
+    "greedy_generate_resident",
     "ResidentLayerHandles",
     "ResidentMoEWeights",
     "ResidentTensor",

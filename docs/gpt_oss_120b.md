@@ -86,6 +86,8 @@ Representative results:
 | Two-stage parallel MoE, 48 tokens | 5 / 48 | 5.9 s | 0.506 s/token | 29.7 s |
 | Previous row + CPU decode attention | 5 / 48 | 6.2 s | 0.486 s/token | 29.1 s |
 | Previous row + parallel staging memcpy | 5 / 48 | 4.3 s | 0.394 s/token | 22.8 s |
+| Fully resident decode, 64 tokens | 5 / 64 | CPU prefill | 0.229 s/token | 15.8 s |
+| Fully resident 320-token stress | 7 / 320 | CPU prefill | 0.272 s/token | 95.7 s |
 | 28-slot GPU cache + mmap expert rows | 5 / 16 | 7.7 s | 2.3 s/token | 41.8 s |
 
 Twenty-four slots are the default because 28 slots consume more VRAM without a
@@ -137,13 +139,33 @@ prompt later in the process took about 6.2 seconds. Prefill fell from 3.66 to
 Recommended defaults:
 
 ```text
-FREETOKEN_CACHE_SLOTS=24
+FREETOKEN_CACHE_SLOTS=18
 FREETOKEN_CACHE_POLICY=lfu
 FREETOKEN_GPU_CACHE=1
 FREETOKEN_PIN_LM_HEAD=1
 FREETOKEN_PREFILL_CHUNK=0
 FREETOKEN_CPU_THREADS=12
 ```
+
+## Fully resident decode
+
+The default `chat_120b.py` path keeps single-token decode resident across all
+36 layers:
+
+1. resident RMSNorm plus Q/K/V projections;
+2. resident RoPE, capacity-strided KV append, and attention;
+3. resident O projection, residual, post-attention norm, and router;
+4. resident top-4 weights, with only 16 bytes of global IDs downloaded for
+   expert-cache remapping;
+5. resident-input/output two-stage MoE and final residual;
+6. resident final norm and LM head.
+
+All FP32 projection/norm/router/sink weights consume 3.61 GiB. Together with
+the FP32 LM head and an 18-slot expert cache, final measured resident usage is
+13.77 GiB. A 64-token comparison exactly matched the legacy token sequence and
+reduced runtime from 32.7 to 15.8 seconds in the final cold-run matrix. A
+320-token stress generated all 320 tokens with resident allocation unchanged at
+14,782,134,528 bytes.
 
 ## Known limits
 

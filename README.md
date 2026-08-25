@@ -69,8 +69,10 @@ python\chat_120b.py --max-new-tokens 48 "The capital of France is"
 python\chat_120b.py --max-new-tokens 48
 ```
 
-The model, LM head, and 24-slot-per-layer LFU expert cache are initialized only
-once. Repeated prompts can be significantly faster as the expert cache warms.
+Resident decode is the default: the model, FP32 LM head, all 36 layers of
+projection/norm/router weights, and an 18-slot-per-layer LFU expert cache are
+initialized once. Use `--legacy-decode` to select the older CPU/tensor path.
+Repeated prompts can be significantly faster as the expert cache warms.
 
 ## Sample output - real, from `demo_long_gen.py`
 
@@ -174,7 +176,7 @@ is documented in [docs/gpu_resident_decode_plan.md](docs/gpu_resident_decode_pla
 ## What's NOT here - and why
 
 - No batched-submit implementation. We measured the current ceiling at approximately 18 ms per Vulkan submit-execute-fence-signal round-trip on RDNA2/Windows AMD driver. Breaking that requires keeping activations in VRAM across kernels and issuing 1-2 submits per layer instead of approximately 4. Well-scoped, not built.
-- gpt-oss-120b works through file-backed MXFP4 expert streaming, a bounded per-layer VRAM expert cache, and a two-stage parallel MoE pipeline. See [docs/gpt_oss_120b.md](docs/gpt_oss_120b.md). A verified 48-token run decodes at approximately 0.39 s/token on the tested configuration.
+- gpt-oss-120b works through file-backed MXFP4 expert streaming, a bounded per-layer VRAM expert cache, and a two-stage parallel MoE pipeline. See [docs/gpt_oss_120b.md](docs/gpt_oss_120b.md). A verified 64-token resident run decodes at approximately 0.22 s/token on the tested configuration, and a 320-token stress run completes without VRAM growth or OOM.
 - No CUDA, no ROCm, no Triton. This is by design - the point is to have a backend for AMD (and Intel Arc, Apple, mobile) that doesn't depend on those.
 
 ## Credits

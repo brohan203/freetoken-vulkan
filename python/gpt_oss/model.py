@@ -23,6 +23,7 @@ class GptOssModel:
         self._model_dir = None
         self.resident_moe: ResidentMoEWeights | None = None
         self.resident_projections = None
+        self.h_final_norm: int | None = None
         self.streamed_resident = None
         self.h_lm_head: int | None = None
         self._lm_head_shape: tuple[int, int] | None = None
@@ -77,6 +78,9 @@ class GptOssModel:
             from .resident_projections import ResidentProjectionWeights
             self.resident_projections = ResidentProjectionWeights(
                 self.ext, self.weights, verbose=verbose
+            )
+            self.h_final_norm = self.ext.upload_resident(
+                self.weights.final_norm.contiguous()
             )
 
     def pin_lm_head_to_vram(self) -> None:

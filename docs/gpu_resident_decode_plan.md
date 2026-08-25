@@ -174,6 +174,31 @@ only 16 bytes of global top-4 IDs should cross to CPU for expert-cache remap.
 See [resident_decode_layer_audit.md](resident_decode_layer_audit.md) for exact
 layout, barrier, VRAM, and dispatch contracts.
 
+### Phase 3 full-model status
+
+Fully resident single-token decode is integrated and enabled by default in
+`chat_120b.py`:
+
+- all 36 FP32 projection/norm/router/sink weight sets are resident;
+- CPU prefill KV tensors transfer once into capacity-strided resident slabs;
+- only four global expert IDs (16 bytes) cross to CPU per layer for cache
+  remapping;
+- routing weights, activations, attention, MoE scratch/output, final norm, and
+  LM-head inputs/outputs remain resident;
+- 18 expert slots/layer keep total measured resident allocation at 13.77 GiB.
+
+Validation:
+
+- one resident layer max error `2.44e-4`, approximately 2.91x faster than the
+  current warm layer (`2.263 ms` vs `6.587 ms`);
+- 64-token output exactly matches legacy; runtime `32.66 s` -> `15.84 s`,
+  resident decode average `0.229 s/token`;
+- 320-token stress completed in `95.66 s`, decode average `0.272 s/token`,
+  resident bytes unchanged before/after (`14,782,134,528`), no OOM.
+
+The layer still uses several submissions. The next optimization is command-
+buffer fusion after the expert-ID CPU synchronization point.
+
 ## Phase 4: transfer-queue overlap
 
 Hardware query on the tested RX 6800 XT found:
