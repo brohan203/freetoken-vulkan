@@ -1,4 +1,4 @@
-"""Bounded per-layer VRAM cache for streamed gpt-oss experts."""
+"""Bounded per-layer device-local cache for streamed MXFP4 experts."""
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
@@ -58,7 +58,7 @@ class StreamedResidentMoECache:
 
     def _allocate(self, layer_idx: int, prototype: ExpertTensors) -> _LayerSlab:
         tensors = self._tensors(prototype)
-        row_bytes = tuple(t.numel() * t.element_size() for t in tensors)
+        row_bytes = tuple(tensor.numel() * tensor.element_size() for tensor in tensors)
         handles = [
             self.ext.allocate_resident(size * self.slots_per_layer)
             for size in row_bytes
@@ -86,13 +86,15 @@ class StreamedResidentMoECache:
         return slab
 
     def _evict(self, slab: _LayerSlab, selected: set[int]) -> int:
-        candidates = [key for key in slab.slots if key not in selected]
+        candidates = [expert for expert in slab.slots if expert not in selected]
         if not candidates:
             raise RuntimeError("no cache victim available outside selected experts")
         if self.policy == "lfu":
             victim = min(
                 candidates,
-                key=lambda key: (slab.frequencies[key], slab.recency[key]),
+                key=lambda expert: (
+                    slab.frequencies[expert], slab.recency[expert]
+                ),
             )
         else:
             victim = candidates[0]
@@ -100,47 +102,138 @@ class StreamedResidentMoECache:
         slab.recency.pop(victim, None)
         return slot
 
-    def _prepare(self, layer_idx: int, store: ExpertStore, global_indices: torch.Tensor) -> tuple[_LayerSlab, torch.Tensor]:
+    def _prepare(
+        self,
+        layer_idx: int,
+        store: ExpertStore,
+        global_indices: torch.Tensor,
+    ) -> tuple[_LayerSlab, torch.Tensor]:
         import time
+
         ids = torch.unique(global_indices.to(torch.int64), sorted=True).tolist()
         store.record_selection(layer_idx, ids)
         if len(ids) > self.slots_per_layer:
             raise RuntimeError("resident expert path exceeds configured slots")
+
         slab = self.layers[layer_idx]
         resident_ids = set(slab.slots) if slab is not None else set()
-        missing = [expert_id for expert_id in ids if expert_id not in resident_ids]
-        self.hits += len(ids) - len(missing); self.misses += len(missing)
+        missing = [expert for expert in ids if expert not in resident_ids]
+        self.hits += len(ids) - len(missing)
+        self.misses += len(missing)
         loaded = store.mapped_experts(layer_idx, missing)
+
         if slab is None:
-            if not missing: raise RuntimeError("cannot initialize slab without expert")
+            if not missing:
+                raise RuntimeError("cannot initialize slab without an expert")
             slab = self._allocate(layer_idx, loaded[missing[0]])
-        for expert_id in ids:
-            slab.clock += 1; slab.frequencies[expert_id] += 1; slab.recency[expert_id] = slab.clock
-        selected=set(ids); upload_handles=[]; upload_tensors=[]; upload_offsets=[]
-        for expert_id in ids:
-            if expert_id in slab.slots:
-                slab.slots.move_to_end(expert_id); continue
-            slot=slab.free_slots.pop(0) if slab.free_slots else self._evict(slab,selected)
-            slab.slots[expert_id]=slot; expert=loaded[expert_id]
-            for handle,tensor,row_bytes in zip((slab.handles.h_gu_blocks,slab.handles.h_gu_scales,slab.handles.h_gu_bias,slab.handles.h_d_blocks,slab.handles.h_d_scales,slab.handles.h_d_bias),self._tensors(expert),slab.row_bytes):
-                upload_handles.append(handle);upload_tensors.append(tensor);upload_offsets.append(slot*row_bytes);self.uploaded_bytes += tensor.numel()*tensor.element_size()
+
+        for expert in ids:
+            slab.clock += 1
+            slab.frequencies[expert] += 1
+            slab.recency[expert] = slab.clock
+
+        selected = set(ids)
+        upload_handles: list[int] = []
+        upload_tensors: list[torch.Tensor] = []
+        upload_offsets: list[int] = []
+        for expert in ids:
+            if expert in slab.slots:
+                slab.slots.move_to_end(expert)
+                continue
+            slot = (
+                slab.free_slots.pop(0)
+                if slab.free_slots
+                else self._evict(slab, selected)
+            )
+            slab.slots[expert] = slot
+            tensors = loaded[expert]
+            for handle, tensor, bytes_per_row in zip(
+                (
+                    slab.handles.h_gu_blocks,
+                    slab.handles.h_gu_scales,
+                    slab.handles.h_gu_bias,
+                    slab.handles.h_d_blocks,
+                    slab.handles.h_d_scales,
+                    slab.handles.h_d_bias,
+                ),
+                self._tensors(tensors),
+                slab.row_bytes,
+            ):
+                upload_handles.append(handle)
+                upload_tensors.append(tensor)
+                upload_offsets.append(slot * bytes_per_row)
+                self.uploaded_bytes += tensor.numel() * tensor.element_size()
+
         if upload_handles:
-            t0=time.perf_counter();self.ext.upload_resident_batch(upload_handles,upload_tensors,upload_offsets);self.upload_seconds += time.perf_counter()-t0
-        local=global_indices.to(torch.int32).clone()
-        for expert_id in ids: local[global_indices==expert_id]=slab.slots[expert_id]
-        return slab,local.contiguous()
+            started = time.perf_counter()
+            self.ext.upload_resident_batch(
+                upload_handles, upload_tensors, upload_offsets
+            )
+            self.upload_seconds += time.perf_counter() - started
 
-    def call(self, layer_idx: int, store: ExpertStore, x: torch.Tensor, global_indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        local = global_indices.to(torch.int32).clone()
+        for expert in ids:
+            local[global_indices == expert] = slab.slots[expert]
+        return slab, local.contiguous()
+
+    def call(
+        self,
+        layer_idx: int,
+        store: ExpertStore,
+        x: torch.Tensor,
+        global_indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
         if torch.unique(global_indices).numel() > self.slots_per_layer:
-            compact,local=store.materialize_selected(layer_idx,global_indices)
-            return self.ext.moe_mlp_gpt_oss(x,local,weights,compact.gate_up_blocks,compact.gate_up_scales,compact.gate_up_bias,compact.down_blocks,compact.down_scales,compact.down_bias)
-        slab,local=self._prepare(layer_idx,store,global_indices)
-        return slab.handles.call(self.ext,x,local,weights,two_stage=True)
+            compact, local = store.materialize_selected(layer_idx, global_indices)
+            return self.ext.moe_mlp_gpt_oss(
+                x,
+                local,
+                weights,
+                compact.gate_up_blocks,
+                compact.gate_up_scales,
+                compact.gate_up_bias,
+                compact.down_blocks,
+                compact.down_scales,
+                compact.down_bias,
+            )
+        slab, local = self._prepare(layer_idx, store, global_indices)
+        return slab.handles.call(
+            self.ext, x, local, weights, two_stage=True
+        )
 
-    def call_resident(self, layer_idx: int, store: ExpertStore, x_handle: int, global_indices: torch.Tensor, weights_handle: int, indices_handle: int, hidden_handle: int, output_handle: int, rows: int = 1) -> None:
-        slab,local=self._prepare(layer_idx,store,global_indices)
-        self.ext.update_resident(indices_handle,local,0)
-        self.ext.moe_mlp_gpt_oss_twostage_io(x_handle,indices_handle,weights_handle,hidden_handle,output_handle,slab.handles.h_gu_blocks,slab.handles.h_gu_scales,slab.handles.h_gu_bias,slab.handles.h_d_blocks,slab.handles.h_d_scales,slab.handles.h_d_bias,slab.handles.E,slab.handles.D,slab.handles.Dff,rows,4)
+    def call_resident(
+        self,
+        layer_idx: int,
+        store: ExpertStore,
+        x_handle: int,
+        global_indices: torch.Tensor,
+        weights_handle: int,
+        indices_handle: int,
+        hidden_handle: int,
+        output_handle: int,
+        rows: int = 1,
+    ) -> None:
+        slab, local = self._prepare(layer_idx, store, global_indices)
+        self.ext.update_resident(indices_handle, local, 0)
+        self.ext.moe_mlp_gpt_oss_twostage_io(
+            x_handle,
+            indices_handle,
+            weights_handle,
+            hidden_handle,
+            output_handle,
+            slab.handles.h_gu_blocks,
+            slab.handles.h_gu_scales,
+            slab.handles.h_gu_bias,
+            slab.handles.h_d_blocks,
+            slab.handles.h_d_scales,
+            slab.handles.h_d_bias,
+            slab.handles.E,
+            slab.handles.D,
+            slab.handles.Dff,
+            rows,
+            4,
+        )
 
     def free(self) -> None:
         for slab in self.layers:
