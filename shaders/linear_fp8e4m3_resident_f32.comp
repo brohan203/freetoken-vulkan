@@ -1,0 +1,12 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer WBuf { uint8_t W[]; };
+layout(std430,binding=1) readonly buffer SBuf { float scales[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P { uint T;uint N;uint K;uint scale_cols; } p;
+shared float sums[128];
+float fp8(uint raw){uint sign=raw>>7u,e=(raw>>3u)&15u,m=raw&7u;float v;if(e==0u)v=float(m)*0.001953125;else v=(1.0+float(m)*0.125)*exp2(float(int(e)-7));return sign!=0u?-v:v;}
+void main(){uint n=gl_WorkGroupID.x,t=gl_WorkGroupID.y,tid=gl_LocalInvocationID.x;if(n>=p.N||t>=p.T)return;float acc=0.0;uint wo=n*p.K,xo=t*p.K,sr=(n/128u)*p.scale_cols;for(uint k=tid;k<p.K;k+=128u){float scale=scales[sr+k/128u];acc=fma(X[xo+k],fp8(uint(W[wo+k]))*scale,acc);}sums[tid]=acc;barrier();for(uint s=64u;s>0u;s>>=1u){if(tid<s)sums[tid]+=sums[tid+s];barrier();}if(tid==0u)Y[t*p.N+n]=sums[0];}

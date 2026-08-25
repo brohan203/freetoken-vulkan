@@ -953,6 +953,14 @@ void oproj_router_resident_vulkan(
     });
 }
 
+void linear_fp8e4m3_resident_io_vulkan(
+    int64_t x_handle, int64_t h_w, int64_t h_scales, int64_t y_handle,
+    int64_t T, int64_t N, int64_t K, int64_t scale_cols) {
+    auto& pipe=get_pipeline("linear_fp8e4m3_resident_f32.comp.spv",4,16);
+    struct PC{uint32_t T,N,K,scale_cols;}pc{(uint32_t)T,(uint32_t)N,(uint32_t)K,(uint32_t)scale_cols};
+    run_kernel(pipe,{resident_buf(h_w),resident_buf(h_scales),resident_buf(x_handle),resident_buf(y_handle)},&pc,(uint32_t)N,(uint32_t)T,1);
+}
+
 void linear_bf16_resident_io_vulkan(
     int64_t x_handle, int64_t h_w, int64_t h_b, int64_t y_handle,
     int64_t T, int64_t N, int64_t K, bool use_bias) {
@@ -1784,6 +1792,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("logits_handle"), py::arg("rows"), py::arg("hidden"),
           py::arg("attention_size"), py::arg("experts"),
           py::arg("eps") = 1e-5);
+    m.def("linear_fp8e4m3_resident_io", &linear_fp8e4m3_resident_io_vulkan,
+          "FP32 linear output with resident block-scaled FP8 E4M3 weights.",
+          py::arg("x_handle"), py::arg("w_handle"),
+          py::arg("scales_handle"), py::arg("y_handle"),
+          py::arg("T"), py::arg("N"), py::arg("K"),
+          py::arg("scale_cols"));
     m.def("linear_bf16_resident_io", &linear_bf16_resident_io_vulkan,
           "FP32 linear output with resident BF16 weights and bias.",
           py::arg("x_handle"), py::arg("w_handle"), py::arg("b_handle"),
