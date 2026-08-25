@@ -28,6 +28,7 @@ class GptOssModel:
         self.h_lm_head: int | None = None
         self._lm_head_shape: tuple[int, int] | None = None
         self._lm_head_fp16 = False
+        self._closed = False
 
     @classmethod
     def from_pretrained(
@@ -57,6 +58,7 @@ class GptOssModel:
         return model
 
     def pin_moe_to_vram(self, verbose: bool = True) -> None:
+        self._require_open()
         if self.resident_moe is None:
             self.resident_moe = ResidentMoEWeights(
                 self.ext, self.weights, verbose=verbose
@@ -66,6 +68,7 @@ class GptOssModel:
         self, slots_per_layer: int = 24, policy: str = "lfu"
     ) -> None:
         """Cache streamed experts in bounded per-layer VRAM slabs."""
+        self._require_open()
         if self.weights.expert_store is None:
             raise RuntimeError("streamed VRAM cache requires stream_experts=True")
         if self.streamed_resident is None:
@@ -75,6 +78,7 @@ class GptOssModel:
             )
 
     def pin_projections_to_vram(self, verbose: bool = True) -> None:
+        self._require_open()
         if self.resident_projections is None:
             from .resident_projections import ResidentProjectionWeights
             self.resident_projections = ResidentProjectionWeights(
@@ -85,6 +89,7 @@ class GptOssModel:
             )
 
     def pin_lm_head_to_vram(self, fp16: bool = False) -> None:
+        self._require_open()
         if self.h_lm_head is not None:
             return
         source = (
@@ -106,6 +111,45 @@ class GptOssModel:
         self.pin_moe_to_vram()
         self.pin_lm_head_to_vram()
 
+    def close(self) -> None:
+        """Release model-owned resident allocations exactly once."""
+        if self._closed:
+            return
+        if self.resident_moe is not None:
+            self.resident_moe.free()
+            self.resident_moe = None
+        if self.streamed_resident is not None:
+            self.streamed_resident.free()
+            self.streamed_resident = None
+        if self.resident_projections is not None:
+            self.resident_projections.free()
+            self.resident_projections = None
+        if self.h_final_norm is not None:
+            self.ext.free_resident(self.h_final_norm)
+            self.h_final_norm = None
+        if self.h_lm_head is not None:
+            self.ext.free_resident(self.h_lm_head)
+            self.h_lm_head = None
+        self._lm_head_shape = None
+        self._closed = True
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("GptOssModel has been closed")
+
+    def __enter__(self) -> "GptOssModel":
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _get_hf_cfg(self):
         if self._hf_cfg is None:
             from transformers import AutoConfig
@@ -113,9 +157,11 @@ class GptOssModel:
         return self._hf_cfg
 
     def make_kv_cache(self, max_seqlen: int = 1024, batch: int = 1) -> KVCache:
+        self._require_open()
         return KVCache(self.cfg, batch=batch, max_seqlen=max_seqlen)
 
     def compute_rope(self, positions: torch.Tensor):
+        self._require_open()
         return compute_cos_sin_for_positions(self._get_hf_cfg(), positions)
 
     def forward(
@@ -126,6 +172,7 @@ class GptOssModel:
         only_last_logits: bool = False,
     ) -> torch.Tensor:
         """Run new tokens through the model and return FP32 logits."""
+        self._require_open()
 
         batch, new_tokens = input_ids.shape
         cfg = self.cfg

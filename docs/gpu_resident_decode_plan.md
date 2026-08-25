@@ -196,8 +196,14 @@ Validation:
 - 320-token stress completed in `95.66 s`, decode average `0.272 s/token`,
   resident bytes unchanged before/after (`14,782,134,528`), no OOM.
 
-The layer still uses several submissions. The next optimization is command-
-buffer fusion after the expert-ID CPU synchronization point.
+The layer still uses several submissions. Command-buffer fusion experiments
+were correct but slower on the tested AMD driver, so the validated multi-submit
+schedule remains active.
+
+`GptOssModel` now owns and explicitly releases resident projections, final norm,
+LM head, expert slabs, and optional eager MoE weights. `close()` is idempotent;
+a real resident 20b lifecycle test returned `resident_bytes_total()` from
+15,053,650,176 bytes exactly to zero and rejected subsequent forward calls.
 
 ## Resident prefill extension
 
