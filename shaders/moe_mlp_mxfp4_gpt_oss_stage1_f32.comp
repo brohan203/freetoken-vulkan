@@ -1,0 +1,60 @@
+#version 450
+// Stage 1 of parallel gpt-oss MoE: gate/up projection plus activation.
+// One workgroup handles 64 hidden rows for one (token, top-K slot).
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64) in;
+layout(std430,binding=0) readonly buffer GUB { uint8_t blocks[]; };
+layout(std430,binding=1) readonly buffer GUS { uint8_t scales[]; };
+layout(std430,binding=2) readonly buffer GUBias { float bias[]; };
+layout(std430,binding=3) readonly buffer XBuf { float x[]; };
+layout(std430,binding=4) readonly buffer IBuf { uint indices[]; };
+layout(std430,binding=5) writeonly buffer HBuf { float hidden[]; };
+layout(push_constant) uniform P { uint T; uint D; uint Dff; uint E; uint K; } p;
+
+const float FP4[16] = float[](
+    0.0,0.5,1.0,1.5,2.0,3.0,4.0,6.0,
+    -0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0);
+
+float row_dot(uint expert, uint row, uint token) {
+    uint nb = p.D / 32u;
+    uint block_base = (expert * (2u*p.Dff) + row) * nb * 16u;
+    uint scale_base = (expert * (2u*p.Dff) + row) * nb;
+    uint x_base = token * p.D;
+    float acc = 0.0;
+    for (uint b=0u; b<nb; ++b) {
+        float scale = uintBitsToFloat(uint(scales[scale_base+b]) << 23u);
+        uint bo = block_base + b*16u;
+        uint xo = x_base + b*32u;
+        for (uint j=0u; j<16u; ++j) {
+            uint packed = uint(blocks[bo+j]);
+            acc = fma(FP4[packed & 15u]*scale, x[xo+2u*j], acc);
+            acc = fma(FP4[(packed>>4u)&15u]*scale, x[xo+2u*j+1u], acc);
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint chunks = (p.Dff + 63u) / 64u;
+    uint group = gl_WorkGroupID.x;
+    uint chunk = group % chunks;
+    uint pair = group / chunks;
+    uint slot = pair % p.K;
+    uint token = pair / p.K;
+    uint i = chunk*64u + gl_LocalInvocationID.x;
+    if (token >= p.T || i >= p.Dff) return;
+    uint expert = indices[token*p.K + slot];
+    uint gate_row = 2u*i;
+    uint up_row = gate_row + 1u;
+    float gate = row_dot(expert, gate_row, token)
+        + bias[expert*(2u*p.Dff)+gate_row];
+    float up = row_dot(expert, up_row, token)
+        + bias[expert*(2u*p.Dff)+up_row];
+    gate = min(gate, 7.0);
+    up = clamp(up, -7.0, 7.0);
+    float glu = gate / (1.0 + exp(-gate*1.702));
+    hidden[(token*p.K + slot)*p.Dff + i] = (up + 1.0)*glu;
+}

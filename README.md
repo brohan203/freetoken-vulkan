@@ -154,7 +154,7 @@ Every kernel in this repo was validated against a pure-PyTorch reference on real
 ## What's NOT here - and why
 
 - No batched-submit implementation. We measured the current ceiling at approximately 18 ms per Vulkan submit-execute-fence-signal round-trip on RDNA2/Windows AMD driver. Breaking that requires keeping activations in VRAM across kernels and issuing 1-2 submits per layer instead of approximately 4. Well-scoped, not built.
-- gpt-oss-120b works through file-backed MXFP4 expert streaming and a bounded per-layer VRAM expert cache. See [docs/gpt_oss_120b.md](docs/gpt_oss_120b.md). It is slower than 20b because decode remains expert-miss and PCIe/disk bound.
+- gpt-oss-120b works through file-backed MXFP4 expert streaming, a bounded per-layer VRAM expert cache, and a two-stage parallel MoE pipeline. See [docs/gpt_oss_120b.md](docs/gpt_oss_120b.md). A verified 48-token run decodes at approximately 0.51 s/token on the tested configuration.
 - No CUDA, no ROCm, no Triton. This is by design - the point is to have a backend for AMD (and Intel Arc, Apple, mobile) that doesn't depend on those.
 
 ## Credits

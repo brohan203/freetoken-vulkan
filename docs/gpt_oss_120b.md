@@ -82,6 +82,8 @@ Representative results:
 | 24-slot GPU cache + mmap expert rows | 5 / 16 | 7.8 s | 2.3 s/token | 41.8 s |
 | 24-slot GPU cache + mmap rows + resident LM head | 5 / 16 | 6.9 s | 2.09 s/token | 38.2 s |
 | Previous row + 12 PyTorch CPU threads | 5 / 16 | 6.5 s | 1.65 s/token | 31.2 s |
+| Previous row + two-stage parallel MoE | 5 / 16 | 6.7 s | 0.54 s/token | 15.4 s |
+| Two-stage parallel MoE, 48 tokens | 5 / 48 | 5.9 s | 0.506 s/token | 29.7 s |
 | 28-slot GPU cache + mmap expert rows | 5 / 16 | 7.7 s | 2.3 s/token | 41.8 s |
 
 Twenty-four slots are the default because 28 slots consume more VRAM without a
@@ -140,6 +142,10 @@ FREETOKEN_CPU_THREADS=12
 - Decode is PCIe/disk expert-miss bound, not shader-compute bound.
 - The default tuned configuration uses about 12.8 GiB resident VRAM: 24 expert
   slots per layer plus the resident LM head.
+- The MoE compute path uses two stages in one Vulkan submission. Stage 1
+  dispatches gate/up rows across the GPU; stage 2 dispatches down-projection
+  rows and reduces top-K contributions. A direct resident call improved from
+  about 17.2 ms to 1.0 ms with max absolute difference `7.63e-6`.
 - Expert choices remain broad over 128 experts; a 24-slot cache reached about a
   54 percent hit rate over a 16-token run.
 - Larger cache sizes provide diminishing returns.

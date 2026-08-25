@@ -236,19 +236,15 @@ static void ensure_desc_pool() {
     g_desc_pool_used = 0;
 }
 
-static double run_kernel(const KernelPipeline& pipe,
-                         const std::vector<VkBuffer>& buffers,
-                         const void* push_const_data,
-                         uint32_t gx, uint32_t gy, uint32_t gz) {
+static VkDescriptorSet make_descriptor_set(
+    const KernelPipeline& pipe,
+    const std::vector<VkBuffer>& buffers) {
     auto& ctx = get_ctx();
     ensure_desc_pool();
-
-    // Reset pool if we're about to overflow.
     if (g_desc_pool_used + 1 > kDescPoolMaxSets) {
         vkResetDescriptorPool(ctx.device, g_desc_pool, 0);
         g_desc_pool_used = 0;
     }
-
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = g_desc_pool;
     dai.descriptorSetCount = 1;
@@ -256,9 +252,8 @@ static double run_kernel(const KernelPipeline& pipe,
     VkDescriptorSet dset;
     VKU_CHECK(vkAllocateDescriptorSets(ctx.device, &dai, &dset));
     g_desc_pool_used++;
-
     std::vector<VkDescriptorBufferInfo> dbi(buffers.size());
-    std::vector<VkWriteDescriptorSet>   writes(buffers.size());
+    std::vector<VkWriteDescriptorSet> writes(buffers.size());
     for (size_t i = 0; i < buffers.size(); ++i) {
         dbi[i] = {buffers[i], 0, VK_WHOLE_SIZE};
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -268,18 +263,28 @@ static double run_kernel(const KernelPipeline& pipe,
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &dbi[i];
     }
-    vkUpdateDescriptorSets(ctx.device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, (uint32_t)writes.size(),
+                           writes.data(), 0, nullptr);
+    return dset;
+}
 
+static double run_kernel(const KernelPipeline& pipe,
+                         const std::vector<VkBuffer>& buffers,
+                         const void* push_const_data,
+                         uint32_t gx, uint32_t gy, uint32_t gz) {
+    auto& ctx = get_ctx();
+    VkDescriptorSet dset = make_descriptor_set(pipe, buffers);
     double ms = vku::submit_and_wait(ctx, [&](VkCommandBuffer cbuf) {
         vkCmdBindPipeline(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
         vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipe.pipeline_layout, 0, 1, &dset, 0, nullptr);
         if (pipe.push_const_size > 0 && push_const_data != nullptr) {
-            vkCmdPushConstants(cbuf, pipe.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            vkCmdPushConstants(cbuf, pipe.pipeline_layout,
+                               VK_SHADER_STAGE_COMPUTE_BIT,
                                0, pipe.push_const_size, push_const_data);
         }
         vkCmdDispatch(cbuf, gx, gy, 1);
-        (void)gz;   // 1D/2D dispatch only for now
+        (void)gz;
     });
     return ms;
 }
@@ -1056,6 +1061,80 @@ torch::Tensor moe_mlp_gpt_oss_vulkan(
 //
 // x, indices, weights, y still go through the normal per-call upload path.
 // ============================================================
+torch::Tensor moe_mlp_gpt_oss_twostage_vulkan(
+    torch::Tensor x, torch::Tensor indices, torch::Tensor weights,
+    int64_t h_gu_blocks, int64_t h_gu_scales, int64_t h_gu_bias,
+    int64_t h_d_blocks, int64_t h_d_scales, int64_t h_d_bias,
+    int64_t E, int64_t D, int64_t Dff) {
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "x fp32");
+    const int64_t T = x.size(0);
+    const int64_t K = indices.size(1);
+    auto xc = x.contiguous();
+    auto idx = indices.contiguous().to(torch::kInt32);
+    auto routing = weights.contiguous();
+    auto output = torch::empty({T, D}, x.options());
+    auto& ctx = get_ctx();
+    auto& stage1 = get_pipeline(
+        "moe_mlp_mxfp4_gpt_oss_stage1_f32.comp.spv", 6, 20);
+    auto& stage2 = get_pipeline(
+        "moe_mlp_mxfp4_gpt_oss_stage2_f32.comp.spv", 7, 20);
+    const size_t x_bytes = (size_t)T * D * sizeof(float);
+    const size_t idx_bytes = (size_t)T * K * sizeof(uint32_t);
+    const size_t weight_bytes = (size_t)T * K * sizeof(float);
+    const size_t hidden_bytes = (size_t)T * K * Dff * sizeof(float);
+    const size_t output_bytes = x_bytes;
+    CallBuffers cb;
+    cb.bufs.push_back(get_pool().acquire_host(x_bytes));
+    cb.bufs.push_back(get_pool().acquire_host(idx_bytes));
+    cb.bufs.push_back(get_pool().acquire_host(weight_bytes));
+    cb.bufs.push_back(get_pool().acquire_host(hidden_bytes));
+    cb.bufs.push_back(get_pool().acquire_host(output_bytes));
+    vku::upload(ctx, cb.bufs[0], xc.data_ptr<float>(), x_bytes);
+    vku::upload(ctx, cb.bufs[1], idx.data_ptr<int32_t>(), idx_bytes);
+    vku::upload(ctx, cb.bufs[2], routing.data_ptr<float>(), weight_bytes);
+    std::vector<VkBuffer> b1 = {
+        resident_buf(h_gu_blocks), resident_buf(h_gu_scales),
+        resident_buf(h_gu_bias), cb.bufs[0].buf, cb.bufs[1].buf,
+        cb.bufs[3].buf};
+    std::vector<VkBuffer> b2 = {
+        resident_buf(h_d_blocks), resident_buf(h_d_scales),
+        resident_buf(h_d_bias), cb.bufs[3].buf, cb.bufs[1].buf,
+        cb.bufs[2].buf, cb.bufs[4].buf};
+    VkDescriptorSet d1 = make_descriptor_set(stage1, b1);
+    VkDescriptorSet d2 = make_descriptor_set(stage2, b2);
+    struct PC { uint32_t T, D, Dff, E, K; } pc = {
+        (uint32_t)T, (uint32_t)D, (uint32_t)Dff,
+        (uint32_t)E, (uint32_t)K};
+    const uint32_t stage1_groups =
+        (uint32_t)(T * K * ((Dff + 63) / 64));
+    const uint32_t stage2_groups =
+        (uint32_t)(T * ((D + 31) / 32));
+    vku::submit_and_wait(ctx, [&](VkCommandBuffer cmd) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          stage1.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                stage1.pipeline_layout, 0, 1, &d1, 0, nullptr);
+        vkCmdPushConstants(cmd, stage1.pipeline_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &pc);
+        vkCmdDispatch(cmd, stage1_groups, 1, 1);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             1, &barrier, 0, nullptr, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          stage2.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                stage2.pipeline_layout, 0, 1, &d2, 0, nullptr);
+        vkCmdPushConstants(cmd, stage2.pipeline_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &pc);
+        vkCmdDispatch(cmd, stage2_groups, 1, 1);
+    });
+    vku::download(ctx, cb.bufs[4], output.data_ptr<float>(), output_bytes);
+    return output;
+}
+
 torch::Tensor moe_mlp_gpt_oss_resident_vulkan(
     torch::Tensor x,           // [T, D] float32
     torch::Tensor indices,     // [T, K] int32 or int64
@@ -1199,6 +1278,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("resident_bytes_total", &resident_bytes_total_vulkan,
           "Total bytes currently held in resident VRAM buffers across all "
           "outstanding handles.");
+    m.def("moe_mlp_gpt_oss_twostage",
+          &moe_mlp_gpt_oss_twostage_vulkan,
+          "Two-stage parallel resident gpt-oss MoE pipeline.",
+          py::arg("x"), py::arg("indices"), py::arg("weights"),
+          py::arg("h_gu_blocks"), py::arg("h_gu_scales"), py::arg("h_gu_bias"),
+          py::arg("h_d_blocks"), py::arg("h_d_scales"), py::arg("h_d_bias"),
+          py::arg("E"), py::arg("D"), py::arg("Dff"));
     m.def("moe_mlp_gpt_oss_resident", &moe_mlp_gpt_oss_resident_vulkan,
           "Same as moe_mlp_gpt_oss but the 6 MoE weight tensors are "
           "referenced by resident-buffer handles instead of uploaded "

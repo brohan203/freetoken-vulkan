@@ -33,8 +33,13 @@ class ResidentLayerHandles:
     Dff: int
 
     def call(self, ext, x: torch.Tensor, indices: torch.Tensor,
-             weights: torch.Tensor) -> torch.Tensor:
-        return ext.moe_mlp_gpt_oss_resident(
+             weights: torch.Tensor, two_stage: bool = False) -> torch.Tensor:
+        op = (
+            ext.moe_mlp_gpt_oss_twostage
+            if two_stage
+            else ext.moe_mlp_gpt_oss_resident
+        )
+        return op(
             x, indices, weights,
             self.h_gu_blocks, self.h_gu_scales, self.h_gu_bias,
             self.h_d_blocks,  self.h_d_scales,  self.h_d_bias,

@@ -187,7 +187,8 @@ class StreamedResidentMoECache:
         for expert_id in ids:
             local_indices[global_indices == expert_id] = slab.slots[expert_id]
         return slab.handles.call(
-            self.ext, x, local_indices.contiguous(), weights
+            self.ext, x, local_indices.contiguous(), weights,
+            two_stage=True,
         )
 
     def free(self) -> None:

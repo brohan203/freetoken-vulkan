@@ -1,0 +1,55 @@
+#version 450
+// Stage 2 of parallel gpt-oss MoE: down projection plus top-K reduction.
+// One workgroup handles 32 output rows for one token.
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 32) in;
+layout(std430,binding=0) readonly buffer DB { uint8_t blocks[]; };
+layout(std430,binding=1) readonly buffer DS { uint8_t scales[]; };
+layout(std430,binding=2) readonly buffer DBias { float bias[]; };
+layout(std430,binding=3) readonly buffer HBuf { float hidden[]; };
+layout(std430,binding=4) readonly buffer IBuf { uint indices[]; };
+layout(std430,binding=5) readonly buffer WBuf { float weights[]; };
+layout(std430,binding=6) writeonly buffer YBuf { float y[]; };
+layout(push_constant) uniform P { uint T; uint D; uint Dff; uint E; uint K; } p;
+
+const float FP4[16] = float[](
+    0.0,0.5,1.0,1.5,2.0,3.0,4.0,6.0,
+    -0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0);
+
+float down_dot(uint expert, uint row, uint token, uint slot) {
+    uint nb = p.Dff / 32u;
+    uint block_base = (expert*p.D + row)*nb*16u;
+    uint scale_base = (expert*p.D + row)*nb;
+    uint h_base = (token*p.K + slot)*p.Dff;
+    float acc = 0.0;
+    for (uint b=0u; b<nb; ++b) {
+        float scale = uintBitsToFloat(uint(scales[scale_base+b]) << 23u);
+        uint bo = block_base + b*16u;
+        uint ho = h_base + b*32u;
+        for (uint j=0u; j<16u; ++j) {
+            uint packed = uint(blocks[bo+j]);
+            acc = fma(FP4[packed & 15u]*scale, hidden[ho+2u*j], acc);
+            acc = fma(FP4[(packed>>4u)&15u]*scale, hidden[ho+2u*j+1u], acc);
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint groups_per_token = (p.D + 31u) / 32u;
+    uint token = gl_WorkGroupID.x / groups_per_token;
+    uint row = (gl_WorkGroupID.x % groups_per_token)*32u
+        + gl_LocalInvocationID.x;
+    if (token >= p.T || row >= p.D) return;
+    float result = 0.0;
+    for (uint slot=0u; slot<p.K; ++slot) {
+        uint expert = indices[token*p.K + slot];
+        float contribution = down_dot(expert,row,token,slot)
+            + bias[expert*p.D+row];
+        result = fma(weights[token*p.K+slot], contribution, result);
+    }
+    y[token*p.D+row] = result;
+}

@@ -94,7 +94,9 @@ add_shader(moe_mlp shaders/moe_mlp_lg_f32.comp)
 add_custom_target(mxfp4_matvec_spv ALL
     DEPENDS ${CMAKE_BINARY_DIR}/shaders/mxfp4_matvec_f32.comp.spv
             ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_f32.comp.spv
-            ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_par_f32.comp.spv)
+            ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_par_f32.comp.spv
+            ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage1_f32.comp.spv
+            ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage2_f32.comp.spv)
 add_custom_command(
     OUTPUT  ${CMAKE_BINARY_DIR}/shaders/mxfp4_matvec_f32.comp.spv
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
@@ -129,6 +131,29 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_par_f32.comp
     DEPENDS ${CMAKE_SOURCE_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_par_f32.comp
     COMMENT "glslc shaders/moe_mlp_mxfp4_gpt_oss_par_f32.comp"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT  ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage1_f32.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+    COMMAND ${Vulkan_GLSLC_EXECUTABLE}
+            --target-env=vulkan1.2 -O
+            -o ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage1_f32.comp.spv
+            ${CMAKE_SOURCE_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage1_f32.comp
+    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage1_f32.comp
+    COMMENT "glslc shaders/moe_mlp_mxfp4_gpt_oss_stage1_f32.comp"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT  ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage2_f32.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+    COMMAND ${Vulkan_GLSLC_EXECUTABLE}
+            --target-env=vulkan1.2 -O
+            -o ${CMAKE_BINARY_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage2_f32.comp.spv
+            ${CMAKE_SOURCE_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage2_f32.comp
+    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/moe_mlp_mxfp4_gpt_oss_stage2_f32.comp
+    COMMENT "glslc shaders/moe_mlp_mxfp4_gpt_oss_stage2_f32.comp"
     VERBATIM
 )
 
