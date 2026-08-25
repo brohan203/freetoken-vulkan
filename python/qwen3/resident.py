@@ -159,39 +159,49 @@ def resident_qwen3_layer(
 ) -> int:
     cfg = workspace.config
     output_slot = 1 - input_slot
-    x = workspace.hidden[input_slot]
-    out = workspace.hidden[output_slot]
-    d = cfg.hidden_size
-    hd = cfg.head_dim
-    hq = cfg.num_attention_heads
-    hkv = cfg.num_key_value_heads
-
-    ext.rmsnorm_resident(x.handle, weights.input_norm, workspace.normalized.handle, 1, d, cfg.rms_norm_eps)
-    for weight, target, width in (
-        (weights.q_weight, workspace.q, cfg.query_size),
-        (weights.k_weight, workspace.k, cfg.kv_size),
-        (weights.v_weight, workspace.v, cfg.kv_size),
-    ):
-        ext.linear_bf16_resident_io(workspace.normalized.handle, weight, 0, target.handle, 1, width, d, False)
-    ext.rmsnorm_resident(workspace.q.handle, weights.q_norm, workspace.q.handle, hq, hd, cfg.rms_norm_eps)
-    ext.rmsnorm_resident(workspace.k.handle, weights.k_norm, workspace.k.handle, hkv, hd, cfg.rms_norm_eps)
-    ext.rope_kv_attention_resident(
-        workspace.q.handle, workspace.k.handle, workspace.v.handle,
-        workspace.cos.handle, workspace.sin.handle,
-        workspace.q_rotated.handle, workspace.k_rotated.handle,
-        workspace.k_cache[layer_idx].handle, workspace.v_cache[layer_idx].handle,
-        workspace.sinks.handle, workspace.attention.handle,
-        1, hq, hkv, 1, hd, position, workspace.capacity, 0, False,
-        1.0 / (hd ** 0.5),
+    ext.qwen3_decode_layer_resident(
+        workspace.hidden[input_slot].handle,
+        weights.input_norm,
+        workspace.normalized.handle,
+        weights.q_weight,
+        workspace.q.handle,
+        weights.k_weight,
+        workspace.k.handle,
+        weights.v_weight,
+        workspace.v.handle,
+        weights.q_norm,
+        weights.k_norm,
+        workspace.cos.handle,
+        workspace.sin.handle,
+        workspace.q_rotated.handle,
+        workspace.k_rotated.handle,
+        workspace.k_cache[layer_idx].handle,
+        workspace.v_cache[layer_idx].handle,
+        workspace.sinks.handle,
+        workspace.attention.handle,
+        weights.o_weight,
+        workspace.projected.handle,
+        workspace.residual.handle,
+        weights.post_norm,
+        workspace.post_normalized.handle,
+        weights.gate_weight,
+        workspace.gate.handle,
+        weights.up_weight,
+        workspace.up.handle,
+        workspace.activated.handle,
+        weights.down_weight,
+        workspace.mlp_output.handle,
+        workspace.hidden[output_slot].handle,
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        position,
+        workspace.capacity,
+        cfg.rms_norm_eps,
+        1.0 / (cfg.head_dim ** 0.5),
     )
-    ext.linear_bf16_resident_io(workspace.attention.handle, weights.o_weight, 0, workspace.projected.handle, 1, d, cfg.query_size, False)
-    ext.add_resident(workspace.projected.handle, x.handle, workspace.residual.handle, d)
-    ext.rmsnorm_resident(workspace.residual.handle, weights.post_norm, workspace.post_normalized.handle, 1, d, cfg.rms_norm_eps)
-    ext.linear_bf16_resident_io(workspace.post_normalized.handle, weights.gate_weight, 0, workspace.gate.handle, 1, cfg.intermediate_size, d, False)
-    ext.linear_bf16_resident_io(workspace.post_normalized.handle, weights.up_weight, 0, workspace.up.handle, 1, cfg.intermediate_size, d, False)
-    ext.swiglu_resident(workspace.gate.handle, workspace.up.handle, workspace.activated.handle, cfg.intermediate_size)
-    ext.linear_bf16_resident_io(workspace.activated.handle, weights.down_weight, 0, workspace.mlp_output.handle, 1, d, cfg.intermediate_size, False)
-    ext.add_resident(workspace.residual.handle, workspace.mlp_output.handle, out.handle, d)
     return output_slot
 
 

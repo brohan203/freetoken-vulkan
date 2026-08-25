@@ -184,17 +184,17 @@ Eight-token generation remains exactly token-identical to Transformers:
 The capital of France is Paris. The capital of Germany is Berlin
 ```
 
-Measured resident performance:
+Measured resident performance after dense-layer command fusion:
 
-- model pin time in the validated warm run: `6.10 s`
-- complete five-token prompt plus eight generated tokens: `0.975 s`
-- prompt processing: `0.0820 s/token`
-- decode: `0.0798 s/token` (about 12.5 tokens/second)
+- model pin time in the validated warm run: `6.20 s`
+- complete five-token prompt plus eight generated tokens: `0.332 s`
+- prompt processing: `0.0291 s/token`
+- decode: `0.0257 s/token` (about 38.9 tokens/second)
 - resident allocation unchanged before/after generation
 - explicit workspace/model cleanup returns resident bytes exactly to zero
 
-This is approximately 27x faster per decode token than the lazy correctness
-path (`2.20 s/token`).
+This is approximately 3.1x faster than the initial resident path and more than
+85x faster per decode token than the lazy correctness path (`2.20 s/token`).
 
 ## CLI and long stability
 
@@ -204,8 +204,8 @@ and explicitly frees every resident allocation on exit.
 
 A forced 320-token stability run at max sequence 384 completed with:
 
-- total generation time: `26.67 s`
-- decode average: `0.0809 s/token`
+- total generation time: `10.25 s`
+- decode average: `0.0308 s/token`
 - steady resident allocation: `8,159,443,584` bytes
 - identical resident bytes before and after generation
 - successful explicit cleanup
