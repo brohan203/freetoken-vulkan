@@ -169,6 +169,18 @@ reduced runtime from 32.7 to 15.8 seconds in the final cold-run matrix. A
 320-token stress generated all 320 tokens with resident allocation unchanged at
 14,782,134,528 bytes.
 
+## Optional FP16 resident LM head
+
+`GptOssModel.pin_lm_head_to_vram(fp16=True)` stores the LM head in 1.08 GiB
+instead of 2.16 GiB. The original BF16 checkpoint values are representable in
+FP16 for this tensor (max conversion error `2.98e-8`). Direct full-vocabulary
+matvec validation matched FP32 top-1 with max output difference `1.23e-8`, and
+64-token runs matched all FP32 token IDs for both 18- and 20-slot caches.
+
+This mode is not the default: it did not improve measured decode time. CPU
+prefill intentionally uses the canonical FP32 LM head even when the resident
+decode head is FP16.
+
 ## Incremental token-ID sessions
 
 `ResidentDecodeSession` preserves resident KV state across generation calls and

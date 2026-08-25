@@ -74,6 +74,7 @@ add_shader(attention shaders/kv_cache_append_f32.comp)
 add_shader(attention shaders/topk_softmax_128_f32.comp)
 add_shader(attention shaders/rope_partial_f32.comp)
 add_shader(attention shaders/linear_fp32_resident_f32.comp)
+add_shader(attention shaders/linear_fp16_resident_f32.comp)
 
 # ---- moe_router: phase 6 executable ----
 add_executable(moe_router src/moe_router.cpp)

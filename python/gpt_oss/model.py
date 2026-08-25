@@ -27,6 +27,7 @@ class GptOssModel:
         self.streamed_resident = None
         self.h_lm_head: int | None = None
         self._lm_head_shape: tuple[int, int] | None = None
+        self._lm_head_fp16 = False
 
     @classmethod
     def from_pretrained(
@@ -83,17 +84,21 @@ class GptOssModel:
                 self.weights.final_norm.contiguous()
             )
 
-    def pin_lm_head_to_vram(self) -> None:
+    def pin_lm_head_to_vram(self, fp16: bool = False) -> None:
         if self.h_lm_head is not None:
             return
+        source = (
+            self.weights.lm_head.half().contiguous()
+            if fp16 else self.weights.lm_head.contiguous()
+        )
+        self._lm_head_fp16 = fp16
         print(
             f"[GptOssModel] Pinning lm_head to VRAM "
-            f"({self.weights.lm_head.numel()*4/1024**3:.2f} GB)..."
+            f"({source.numel()*source.element_size()/1024**3:.2f} GB, "
+            f"fp16={fp16})..."
         )
         t0 = time.time()
-        self.h_lm_head = self.ext.upload_resident(
-            self.weights.lm_head.contiguous()
-        )
+        self.h_lm_head = self.ext.upload_resident(source)
         self._lm_head_shape = tuple(self.weights.lm_head.shape)
         print(f"[GptOssModel] lm_head pinned in {time.time()-t0:.1f}s")
 
@@ -158,7 +163,7 @@ class GptOssModel:
         else:
             output_tokens = new_tokens
 
-        if self.h_lm_head is not None:
+        if self.h_lm_head is not None and not self._lm_head_fp16:
             vocab, hidden = self._lm_head_shape
             x_flat = x.reshape(batch * output_tokens, hidden).contiguous()
             logits = self.ext.linear_resident(

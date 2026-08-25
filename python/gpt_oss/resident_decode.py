@@ -293,7 +293,11 @@ def resident_decode_model_step(
         cfg.hidden_size,
         cfg.rms_norm_eps,
     )
-    model.ext.linear_resident_io(
+    linear = (
+        model.ext.linear_fp16_resident_io
+        if model._lm_head_fp16 else model.ext.linear_resident_io
+    )
+    linear(
         workspace.final_normalized.handle,
         model.h_lm_head,
         0,

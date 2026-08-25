@@ -907,6 +907,15 @@ void oproj_router_resident_vulkan(
     });
 }
 
+void linear_fp16_resident_io_vulkan(
+    int64_t x_handle, int64_t h_w, int64_t h_b, int64_t y_handle,
+    int64_t T, int64_t N, int64_t K, bool use_bias) {
+    auto& pipe=get_pipeline("linear_fp16_resident_f32.comp.spv",4,16);
+    struct PC{uint32_t T,N,K,use_bias;}pc{(uint32_t)T,(uint32_t)N,(uint32_t)K,use_bias?1u:0u};
+    VkBuffer w=resident_buf(h_w),b=use_bias?resident_buf(h_b):w;
+    run_kernel(pipe,{w,b,resident_buf(x_handle),resident_buf(y_handle)},&pc,(uint32_t)N,(uint32_t)T,1);
+}
+
 void linear_resident_io_vulkan(
     int64_t x_handle, int64_t h_w, int64_t h_b, int64_t y_handle,
     int64_t T, int64_t N, int64_t K, bool use_bias) {
@@ -1665,6 +1674,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("logits_handle"), py::arg("rows"), py::arg("hidden"),
           py::arg("attention_size"), py::arg("experts"),
           py::arg("eps") = 1e-5);
+    m.def("linear_fp16_resident_io", &linear_fp16_resident_io_vulkan,
+          "FP32 linear output with resident FP16 weights and bias.",
+          py::arg("x_handle"), py::arg("w_handle"), py::arg("b_handle"),
+          py::arg("y_handle"), py::arg("T"), py::arg("N"), py::arg("K"),
+          py::arg("use_bias") = true);
     m.def("linear_resident_io", &linear_resident_io_vulkan,
           "FP32 linear layer with resident input, weight, bias, and output.",
           py::arg("x_handle"), py::arg("w_handle"), py::arg("b_handle"),
