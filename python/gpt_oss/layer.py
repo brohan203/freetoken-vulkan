@@ -18,6 +18,40 @@ def rmsnorm(
     return x * torch.rsqrt(variance + eps) * weight
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _cpu_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    return (
+        x * cos[None, None, :, :]
+        + _rotate_half(x) * sin[None, None, :, :]
+    )
+
+
+def _cpu_decode_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks: torch.Tensor,
+    scale: float,
+    sliding_window: int,
+) -> torch.Tensor:
+    if sliding_window and key.shape[2] > sliding_window:
+        key = key[:, :, -sliding_window:, :]
+        value = value[:, :, -sliding_window:, :]
+    repeats = query.shape[1] // key.shape[1]
+    key = key.repeat_interleave(repeats, dim=1)
+    value = value.repeat_interleave(repeats, dim=1)
+    scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+    sink = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, 1, 1)
+    probabilities = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)
+    return torch.matmul(probabilities[..., :-1], value)
+
+
 def gpt_oss_layer_forward(
     ext,
     x: torch.Tensor,
@@ -55,8 +89,13 @@ def gpt_oss_layer_forward(
     value = value.reshape(
         batch, new_tokens, kv_heads, head_dim
     ).transpose(1, 2).contiguous()
-    query = ext.rope_partial(query, cos, sin, head_dim)
-    key = ext.rope_partial(key, cos, sin, head_dim)
+    cpu_decode = past_kv is not None and new_tokens == 1
+    if cpu_decode:
+        query = _cpu_rope(query, cos, sin)
+        key = _cpu_rope(key, cos, sin)
+    else:
+        query = ext.rope_partial(query, cos, sin, head_dim)
+        key = ext.rope_partial(key, cos, sin, head_dim)
 
     sliding_window = (
         cfg.sliding_window if cfg.layer_is_sliding(layer_idx) else 0
@@ -75,16 +114,22 @@ def gpt_oss_layer_forward(
         past_kv.append(layer_idx, key, value, positions_start=past_len)
         kv_length = past_len + new_tokens
         full_key, full_value = past_kv.slice(layer_idx, seq_end=kv_length)
-        attention = ext.flash_attention_gpt_oss_kv(
-            query,
-            full_key,
-            full_value,
-            weights.sinks,
-            scale,
-            past_len=past_len,
-            sliding_window=sliding_window,
-            use_sinks=use_sinks,
-        )
+        if cpu_decode:
+            attention = _cpu_decode_attention(
+                query, full_key, full_value, weights.sinks,
+                scale, sliding_window,
+            )
+        else:
+            attention = ext.flash_attention_gpt_oss_kv(
+                query,
+                full_key,
+                full_value,
+                weights.sinks,
+                scale,
+                past_len=past_len,
+                sliding_window=sliding_window,
+                use_sinks=use_sinks,
+            )
     attention = attention.transpose(1, 2).contiguous().reshape(
         batch, new_tokens, query_heads * head_dim
     )
