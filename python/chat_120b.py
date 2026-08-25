@@ -132,10 +132,9 @@ def main() -> None:
         finally:
             if workspace is not None:
                 workspace.free()
+            model.close()
         return
 
-    mode = "resident" if resident_decode else "legacy"
-    print(f"gpt-oss-120b ready ({mode} decode). Empty line exits.")
     mode = "resident" if resident_decode else "legacy"
     print(f"gpt-oss-120b ready ({mode} decode). Empty line exits.")
     try:
@@ -153,5 +152,8 @@ def main() -> None:
     finally:
         if workspace is not None:
             workspace.free()
+        model.close()
+
+
 if __name__ == "__main__":
     main()

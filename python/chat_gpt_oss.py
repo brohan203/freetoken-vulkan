@@ -138,6 +138,7 @@ def main() -> None:
     finally:
         if workspace is not None:
             workspace.free()
+        model.close()
 
 
 if __name__ == "__main__":
