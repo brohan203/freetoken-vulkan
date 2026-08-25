@@ -88,6 +88,7 @@ Representative results:
 | Previous row + parallel staging memcpy | 5 / 48 | 4.3 s | 0.394 s/token | 22.8 s |
 | Fully resident decode, 64 tokens | 5 / 64 | CPU prefill | 0.229 s/token | 15.8 s |
 | Fully resident 320-token stress | 7 / 320 | CPU prefill | 0.272 s/token | 95.7 s |
+| Fully resident 768-token stress | 7 / 768 | CPU prefill | 0.296 s/token | 277.2 s |
 | 28-slot GPU cache + mmap expert rows | 5 / 16 | 7.7 s | 2.3 s/token | 41.8 s |
 
 Twenty-four slots are the default because 28 slots consume more VRAM without a
@@ -167,7 +168,8 @@ the FP32 LM head and an 18-slot expert cache, final measured resident usage is
 13.77 GiB. A 64-token comparison exactly matched the legacy token sequence and
 reduced runtime from 32.7 to 15.8 seconds in the final cold-run matrix. A
 320-token stress generated all 320 tokens with resident allocation unchanged at
-14,782,134,528 bytes.
+14,782,134,528 bytes. A 768-token run with `max_seq_len=1024` completed at
+0.296 seconds/token with the same steady-state resident allocation and no OOM.
 
 ## Optional FP16 resident LM head
 
