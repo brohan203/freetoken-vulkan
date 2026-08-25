@@ -99,10 +99,44 @@ Raw-logit differences are expected because Transformers accumulates from BF16
 weights while this correctness runtime expands each layer to FP32. Token ranking
 parity is the acceptance criterion for this milestone.
 
+## KV-cached generation
+
+The dense runtime now uses a preallocated architecture-neutral FP32 KV cache.
+Prefill writes rotated K/V for every layer; single-token decode appends one row
+and uses grouped-query attention over the cached prefix.
+
+One-layer cache equivalence for a three-token prefill plus one decode token:
+
+- maximum absolute difference versus one full causal pass: `6.184e-7`
+- mean absolute difference: `1.103e-7`
+
+Eight-token greedy generation is exactly token-identical to Transformers:
+
+```text
+The capital of France is Paris. The capital of Germany is Berlin
+```
+
+Token IDs:
+
+```text
+[12095, 13, 576, 6722, 315, 9856, 374, 19846]
+```
+
+Initial correctness-path performance:
+
+- prefill: `2.99 s`
+- decode: `2.20 s/token`
+- eight-token runtime: `18.41 s`
+- Transformers eight-token runtime: `5.21 s`
+- KV cache at max sequence 64: `18,874,368` bytes
+
+This path still reloads every layer and performs CPU FP32 dense projections on
+every token. The performance gap is expected until weights and projections are
+resident.
+
 ## Next gates
 
-1. Add KV-cached generation.
-2. Validate multi-token output against Transformers greedy generation.
-3. Pin BF16/FP32 weights resident only after generation correctness passes.
-4. Replace CPU dense projections with resident Vulkan operations.
-5. Add a Qwen3 CLI after sustained-generation stability is verified.
+1. Pin Qwen3 BF16/FP32 weights resident.
+2. Replace CPU dense projections with resident Vulkan operations.
+3. Add sustained-generation stability tests.
+4. Add a Qwen3 CLI after resident decode is verified.
