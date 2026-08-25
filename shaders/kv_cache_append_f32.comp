@@ -1,0 +1,27 @@
+#version 450
+// Append new K/V rows into capacity-strided resident KV-cache slabs.
+layout(local_size_x = 256) in;
+layout(std430,binding=0) readonly buffer KNew { float k_new[]; };
+layout(std430,binding=1) readonly buffer VNew { float v_new[]; };
+layout(std430,binding=2) writeonly buffer KCache { float k_cache[]; };
+layout(std430,binding=3) writeonly buffer VCache { float v_cache[]; };
+layout(push_constant) uniform P {
+    uint B;
+    uint Hkv;
+    uint Snew;
+    uint D;
+    uint start;
+    uint capacity;
+} p;
+void main(){
+    uint i=gl_GlobalInvocationID.x;
+    uint total=p.B*p.Hkv*p.Snew*p.D;
+    if(i>=total)return;
+    uint d=i%p.D;
+    uint q=i/p.D;
+    uint s=q%p.Snew;
+    uint bh=q/p.Snew;
+    uint dst=(bh*p.capacity+p.start+s)*p.D+d;
+    k_cache[dst]=k_new[i];
+    v_cache[dst]=v_new[i];
+}

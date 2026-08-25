@@ -148,6 +148,32 @@ Correctness gate:
 - 20b and 120b layer tests pass;
 - no new VRAM OOM over 320 generated tokens.
 
+### Phase 3 primitive status
+
+Implemented and validated:
+
+- resident full-dimension RoPE;
+- capacity-strided resident K/V append;
+- resident GQA attention with sinks and sliding window;
+- resident router top-4 plus normalized weights;
+- resident-input/control/output two-stage MoE;
+- runtime guard for Stage-1 X dispatch above 65535 workgroups.
+
+Correctness:
+
+- resident attention over five appended positions max error `2.98e-8`;
+- resident K/V slab contents match CPU reference;
+- resident top-4 IDs exactly match PyTorch and weight max error is `7.45e-9`;
+- resident-I/O MoE is bit-exact to transient-I/O two-stage MoE.
+
+A hybrid layer that downloaded Q/K/V for CPU attention and router IDs/weights
+was correct (max layer error `1.07e-4`) but 11 percent slower than the existing
+warm layer. Full integration must keep attention and routing weights resident;
+only 16 bytes of global top-4 IDs should cross to CPU for expert-cache remap.
+
+See [resident_decode_layer_audit.md](resident_decode_layer_audit.md) for exact
+layout, barrier, VRAM, and dispatch contracts.
+
 ## Phase 4: transfer-queue overlap
 
 Hardware query on the tested RX 6800 XT found:

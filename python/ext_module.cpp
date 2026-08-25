@@ -136,6 +136,38 @@ torch::Tensor download_resident_vulkan(int64_t handle,
     return output;
 }
 
+torch::Tensor download_resident_i32_vulkan(
+    int64_t handle, const std::vector<int64_t>& shape) {
+    auto it = g_resident.find(handle);
+    TORCH_CHECK(it != g_resident.end(), "resident buffer handle not found");
+    int64_t elements = 1;
+    for (int64_t dim : shape) elements *= dim;
+    const size_t bytes = (size_t)elements * sizeof(int32_t);
+    TORCH_CHECK(bytes <= (size_t)it->second.size,
+                "resident int32 download exceeds buffer capacity");
+    auto output = torch::empty(shape,
+        torch::TensorOptions().dtype(torch::kInt32));
+    auto& ctx = get_ctx();
+    vku::Buffer staging = get_pool().acquire_host(bytes);
+    vku::submit_and_wait(ctx, [&](VkCommandBuffer cmd) {
+        VkBufferCopy copy{}; copy.size = (VkDeviceSize)bytes;
+        vkCmdCopyBuffer(cmd, it->second.buf, staging.buf, 1, &copy);
+    });
+    vku::download(ctx, staging, output.data_ptr<int32_t>(), bytes);
+    get_pool().release_host(staging);
+    return output;
+}
+
+void topk_resident_vulkan(int64_t logits_handle, int64_t indices_handle,
+                          int64_t weights_handle, int64_t rows) {
+    TORCH_CHECK(rows > 0, "top-K rows must be positive");
+    auto& pipe = get_pipeline("topk_softmax_128_f32.comp.spv", 3, 4);
+    struct PC { uint32_t rows; } pc{(uint32_t)rows};
+    run_kernel(pipe, {resident_buf(logits_handle), resident_buf(indices_handle),
+                      resident_buf(weights_handle)},
+               &pc, (uint32_t)rows, 1, 1);
+}
+
 void rmsnorm_resident_vulkan(int64_t x_handle, int64_t weight_handle,
                              int64_t y_handle, int64_t rows,
                              int64_t hidden, double eps) {
@@ -224,6 +256,11 @@ void upload_resident_batch_vulkan(
         }
     });
     for (auto& buffer : staging) get_pool().release_host(buffer);
+}
+
+void update_resident_vulkan(int64_t handle, torch::Tensor tensor,
+                            int64_t offset) {
+    upload_resident_batch_vulkan({handle}, {tensor}, {offset});
 }
 
 void free_resident_vulkan(int64_t handle) {
@@ -797,6 +834,47 @@ void rmsnorm_qkv_resident_vulkan(
     });
 }
 
+void rope_kv_attention_resident_vulkan(
+    int64_t q_handle, int64_t k_handle, int64_t v_handle,
+    int64_t cos_handle, int64_t sin_handle,
+    int64_t q_rot_handle, int64_t k_rot_handle,
+    int64_t k_cache_handle, int64_t v_cache_handle,
+    int64_t sinks_handle, int64_t output_handle,
+    int64_t B, int64_t Hq, int64_t Hkv, int64_t Snew,
+    int64_t D, int64_t start, int64_t capacity,
+    int64_t sliding_window, bool use_sinks, double scale) {
+    auto& ctx=get_ctx();
+    auto& rope=get_pipeline("rope_partial_f32.comp.spv",4,16);
+    auto& append=get_pipeline("kv_cache_append_f32.comp.spv",4,24);
+    auto& attention=get_pipeline(
+        "flash_attention_gpt_oss_kv_cache_f32.comp.spv",5,44);
+    struct RopePC{uint32_t BH,S,D,rotary_dim;};
+    RopePC qpc{(uint32_t)(B*Hq),(uint32_t)Snew,(uint32_t)D,(uint32_t)D};
+    RopePC kpc{(uint32_t)(B*Hkv),(uint32_t)Snew,(uint32_t)D,(uint32_t)D};
+    struct AppendPC{uint32_t B,Hkv,Snew,D,start,capacity;} apc{
+        (uint32_t)B,(uint32_t)Hkv,(uint32_t)Snew,(uint32_t)D,
+        (uint32_t)start,(uint32_t)capacity};
+    struct AttnPC{
+        uint32_t S_q,S_kv,D,H_q,H_kv,H_q_per_kv,past_len,
+                 sliding_window,use_sinks,capacity;
+        float scale;
+    } attn{(uint32_t)Snew,(uint32_t)(start+Snew),(uint32_t)D,
+        (uint32_t)Hq,(uint32_t)Hkv,(uint32_t)(Hq/Hkv),(uint32_t)start,
+        (uint32_t)sliding_window,use_sinks?1u:0u,(uint32_t)capacity,
+        (float)scale};
+    VkDescriptorSet qset=make_descriptor_set(rope,{resident_buf(q_handle),resident_buf(cos_handle),resident_buf(sin_handle),resident_buf(q_rot_handle)});
+    VkDescriptorSet kset=make_descriptor_set(rope,{resident_buf(k_handle),resident_buf(cos_handle),resident_buf(sin_handle),resident_buf(k_rot_handle)});
+    VkDescriptorSet aset=make_descriptor_set(append,{resident_buf(k_rot_handle),resident_buf(v_handle),resident_buf(k_cache_handle),resident_buf(v_cache_handle)});
+    VkDescriptorSet attnset=make_descriptor_set(attention,{resident_buf(q_rot_handle),resident_buf(k_cache_handle),resident_buf(v_cache_handle),resident_buf(sinks_handle),resident_buf(output_handle)});
+    auto barrier=[&](VkCommandBuffer cmd){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);};
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){
+        auto rope_dispatch=[&](VkDescriptorSet set,const RopePC& pc,uint32_t heads){vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,rope.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,rope.pipeline_layout,0,1,&set,0,nullptr);vkCmdPushConstants(cmd,rope.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,&pc);vkCmdDispatch(cmd,(uint32_t)Snew,heads,1);};
+        rope_dispatch(qset,qpc,(uint32_t)(B*Hq));rope_dispatch(kset,kpc,(uint32_t)(B*Hkv));barrier(cmd);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,append.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,append.pipeline_layout,0,1,&aset,0,nullptr);vkCmdPushConstants(cmd,append.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,24,&apc);vkCmdDispatch(cmd,(uint32_t)((B*Hkv*Snew*D+255)/256),1,1);barrier(cmd);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,attention.pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,attention.pipeline_layout,0,1,&attnset,0,nullptr);vkCmdPushConstants(cmd,attention.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,44,&attn);vkCmdDispatch(cmd,(uint32_t)Snew,(uint32_t)(B*Hq),1);
+    });
+}
+
 void oproj_router_resident_vulkan(
     int64_t attention_handle, int64_t o_weight_handle,
     int64_t o_bias_handle, int64_t projected_handle,
@@ -1241,6 +1319,55 @@ torch::Tensor moe_mlp_gpt_oss_vulkan(
 //
 // x, indices, weights, y still go through the normal per-call upload path.
 // ============================================================
+void moe_mlp_gpt_oss_twostage_io_vulkan(
+    int64_t x_handle, int64_t indices_handle, int64_t weights_handle,
+    int64_t hidden_handle, int64_t output_handle,
+    int64_t h_gu_blocks, int64_t h_gu_scales, int64_t h_gu_bias,
+    int64_t h_d_blocks, int64_t h_d_scales, int64_t h_d_bias,
+    int64_t E, int64_t D, int64_t Dff, int64_t T, int64_t K) {
+    const uint64_t stage1_count = (uint64_t)T*K*((Dff+63)/64);
+    const uint64_t stage2_count = (uint64_t)T*((D+31)/32);
+    TORCH_CHECK(stage1_count <= 65535 && stage2_count <= 65535,
+                "resident MoE dispatch exceeds Vulkan X dimension; "
+                "use transient/prefill path or add 2D dispatch");
+    auto& ctx=get_ctx();
+    auto& stage1=get_pipeline(
+        "moe_mlp_mxfp4_gpt_oss_stage1_f32.comp.spv",6,20);
+    auto& stage2=get_pipeline(
+        "moe_mlp_mxfp4_gpt_oss_stage2_f32.comp.spv",7,20);
+    VkDescriptorSet d1=make_descriptor_set(stage1,{
+        resident_buf(h_gu_blocks),resident_buf(h_gu_scales),
+        resident_buf(h_gu_bias),resident_buf(x_handle),
+        resident_buf(indices_handle),resident_buf(hidden_handle)});
+    VkDescriptorSet d2=make_descriptor_set(stage2,{
+        resident_buf(h_d_blocks),resident_buf(h_d_scales),
+        resident_buf(h_d_bias),resident_buf(hidden_handle),
+        resident_buf(indices_handle),resident_buf(weights_handle),
+        resident_buf(output_handle)});
+    struct PC{uint32_t T,D,Dff,E,K;}pc{
+        (uint32_t)T,(uint32_t)D,(uint32_t)Dff,(uint32_t)E,(uint32_t)K};
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,stage1.pipeline);
+        vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,
+            stage1.pipeline_layout,0,1,&d1,0,nullptr);
+        vkCmdPushConstants(cmd,stage1.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,0,20,&pc);
+        vkCmdDispatch(cmd,(uint32_t)stage1_count,1,1);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,
+            0,nullptr,0,nullptr);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,stage2.pipeline);
+        vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,
+            stage2.pipeline_layout,0,1,&d2,0,nullptr);
+        vkCmdPushConstants(cmd,stage2.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,0,20,&pc);
+        vkCmdDispatch(cmd,(uint32_t)stage2_count,1,1);
+    });
+}
+
 torch::Tensor moe_mlp_gpt_oss_twostage_vulkan(
     torch::Tensor x, torch::Tensor indices, torch::Tensor weights,
     int64_t h_gu_blocks, int64_t h_gu_scales, int64_t h_gu_bias,
@@ -1452,6 +1579,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("download_resident", &download_resident_vulkan,
           "Download a resident FP32 buffer into a CPU tensor.",
           py::arg("handle"), py::arg("shape"));
+    m.def("download_resident_i32", &download_resident_i32_vulkan,
+          "Download a resident int32 buffer into a CPU tensor.",
+          py::arg("handle"), py::arg("shape"));
+    m.def("topk_resident", &topk_resident_vulkan,
+          "Top-4 plus softmax for resident 128-expert router logits.",
+          py::arg("logits_handle"), py::arg("indices_handle"),
+          py::arg("weights_handle"), py::arg("rows"));
     m.def("rmsnorm_resident", &rmsnorm_resident_vulkan,
           "RMSNorm from resident buffers into a resident output buffer.",
           py::arg("x_handle"), py::arg("weight_handle"),
@@ -1461,6 +1595,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Elementwise add of resident FP32 buffers.",
           py::arg("a_handle"), py::arg("b_handle"),
           py::arg("out_handle"), py::arg("elements"));
+    m.def("update_resident", &update_resident_vulkan,
+          "Update a resident buffer from one CPU tensor.",
+          py::arg("handle"), py::arg("tensor"), py::arg("offset") = 0);
     m.def("upload_resident_batch", &upload_resident_batch_vulkan,
           "Upload CPU tensors into resident-buffer subranges in one submit.",
           py::arg("handles"), py::arg("tensors"), py::arg("offsets"));
@@ -1470,6 +1607,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("resident_bytes_total", &resident_bytes_total_vulkan,
           "Total bytes currently held in resident VRAM buffers across all "
           "outstanding handles.");
+    m.def("moe_mlp_gpt_oss_twostage_io",
+          &moe_mlp_gpt_oss_twostage_io_vulkan,
+          "Two-stage MoE with resident activation and control I/O.",
+          py::arg("x_handle"), py::arg("indices_handle"),
+          py::arg("weights_handle"), py::arg("hidden_handle"),
+          py::arg("output_handle"), py::arg("h_gu_blocks"),
+          py::arg("h_gu_scales"), py::arg("h_gu_bias"),
+          py::arg("h_d_blocks"), py::arg("h_d_scales"),
+          py::arg("h_d_bias"), py::arg("E"), py::arg("D"),
+          py::arg("Dff"), py::arg("T"), py::arg("K"));
     m.def("moe_mlp_gpt_oss_twostage",
           &moe_mlp_gpt_oss_twostage_vulkan,
           "Two-stage parallel resident gpt-oss MoE pipeline.",
@@ -1496,6 +1643,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v_handle"), py::arg("rows"), py::arg("hidden"),
           py::arg("q_size"), py::arg("kv_size"),
           py::arg("eps") = 1e-5);
+    m.def("rope_kv_attention_resident",
+          &rope_kv_attention_resident_vulkan,
+          "Resident RoPE, KV-cache append, and capacity-strided attention.",
+          py::arg("q_handle"), py::arg("k_handle"), py::arg("v_handle"),
+          py::arg("cos_handle"), py::arg("sin_handle"),
+          py::arg("q_rot_handle"), py::arg("k_rot_handle"),
+          py::arg("k_cache_handle"), py::arg("v_cache_handle"),
+          py::arg("sinks_handle"), py::arg("output_handle"),
+          py::arg("B"), py::arg("Hq"), py::arg("Hkv"),
+          py::arg("Snew"), py::arg("D"), py::arg("start"),
+          py::arg("capacity"), py::arg("sliding_window"),
+          py::arg("use_sinks"), py::arg("scale"));
     m.def("oproj_router_resident", &oproj_router_resident_vulkan,
           "Fused resident O projection, residual, RMSNorm, and router.",
           py::arg("attention_handle"), py::arg("o_weight_handle"),

@@ -1,0 +1,36 @@
+#version 450
+// Top-4 selection and softmax for rows of exactly 128 expert logits.
+layout(local_size_x = 128) in;
+layout(std430,binding=0) readonly buffer L { float logits[]; };
+layout(std430,binding=1) writeonly buffer I { uint indices[]; };
+layout(std430,binding=2) writeonly buffer W { float weights[]; };
+layout(push_constant) uniform P { uint rows; } p;
+shared float values[128];
+shared uint ids[128];
+void main(){
+ uint row=gl_WorkGroupID.x;
+ uint t=gl_LocalInvocationID.x;
+ if(row>=p.rows)return;
+ values[t]=logits[row*128u+t];ids[t]=t;barrier();
+ // Deterministic bitonic descending sort by value, then lower expert ID.
+ for(uint k=2u;k<=128u;k<<=1u){
+  for(uint j=k>>1u;j>0u;j>>=1u){
+   uint ix=t^j;
+   if(ix>t){
+    bool descending=((t&k)==0u);
+    float a=values[t],b=values[ix];uint ai=ids[t],bi=ids[ix];
+    bool a_before_b=(a>b)||((a==b)&&(ai<bi));
+    bool swap=descending?!a_before_b:a_before_b;
+    if(swap){values[t]=b;values[ix]=a;ids[t]=bi;ids[ix]=ai;}
+   }
+   barrier();
+  }
+ }
+ if(t<4u){
+  float m=values[0];
+  float denom=exp(values[0]-m)+exp(values[1]-m)
+             +exp(values[2]-m)+exp(values[3]-m);
+  indices[row*4u+t]=ids[t];
+  weights[row*4u+t]=exp(values[t]-m)/denom;
+ }
+}
