@@ -185,6 +185,19 @@ void rmsnorm_resident_vulkan(int64_t x_handle, int64_t weight_handle,
                       resident_buf(y_handle)}, &pc, (uint32_t)rows, 1, 1);
 }
 
+void transpose_resident_vulkan(int64_t src_handle, int64_t dst_handle,
+                               int64_t S, int64_t H, int64_t D,
+                               bool inverse) {
+    TORCH_CHECK(S > 0 && H > 0 && D > 0, "invalid transpose shape");
+    auto& pipe = get_pipeline("transpose_shd_hsd_f32.comp.spv", 2, 16);
+    struct PC { uint32_t S, H, D, inverse; } pc{
+        (uint32_t)S, (uint32_t)H, (uint32_t)D,
+        inverse ? 1u : 0u};
+    uint32_t groups = (uint32_t)((S * H * D + 255) / 256);
+    run_kernel(pipe, {resident_buf(src_handle), resident_buf(dst_handle)},
+               &pc, groups, 1, 1);
+}
+
 void add_resident_vulkan(int64_t a_handle, int64_t b_handle,
                          int64_t out_handle, int64_t elements) {
     TORCH_CHECK(elements > 0, "resident add element count must be positive");
@@ -1600,6 +1613,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x_handle"), py::arg("weight_handle"),
           py::arg("y_handle"), py::arg("rows"), py::arg("hidden"),
           py::arg("eps") = 1e-5);
+    m.def("transpose_resident", &transpose_resident_vulkan,
+          "Transpose resident FP32 [S,H,D] and [H,S,D] layouts.",
+          py::arg("src_handle"), py::arg("dst_handle"),
+          py::arg("S"), py::arg("H"), py::arg("D"),
+          py::arg("inverse") = false);
     m.def("add_resident", &add_resident_vulkan,
           "Elementwise add of resident FP32 buffers.",
           py::arg("a_handle"), py::arg("b_handle"),

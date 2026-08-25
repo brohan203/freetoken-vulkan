@@ -1,0 +1,7 @@
+#version 450
+// Convert between [S,H,D] and [H,S,D] row-major layouts.
+layout(local_size_x=256) in;
+layout(std430,binding=0) readonly buffer InBuf { float src[]; };
+layout(std430,binding=1) writeonly buffer OutBuf { float dst[]; };
+layout(push_constant) uniform P { uint S; uint H; uint D; uint inverse; } p;
+void main(){uint i=gl_GlobalInvocationID.x,total=p.S*p.H*p.D;if(i>=total)return;uint d=i%p.D,q=i/p.D,h=q%p.H,s=q/p.H;if(p.inverse==0u)dst[(h*p.S+s)*p.D+d]=src[i];else dst[i]=src[(h*p.S+s)*p.D+d];}

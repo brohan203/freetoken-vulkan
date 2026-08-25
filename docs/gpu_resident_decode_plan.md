@@ -199,6 +199,24 @@ Validation:
 The layer still uses several submissions. The next optimization is command-
 buffer fusion after the expert-ID CPU synchronization point.
 
+## Resident prefill extension
+
+The first resident batched-prefill gate is validated:
+
+- exact `[S,H,D] <-> [H,S,D]` resident transpose;
+- five-token real 120b layer using resident RMSNorm/QKV, transposes, RoPE,
+  capacity-strided causal attention, O/residual/norm/router/top-K, and resident
+  two-stage MoE;
+- 15 unique experts selected (within 18 slots);
+- complete layer max error `1.04e-3`, mean `8.39e-6`;
+- cold one-layer resident time `121 ms`.
+
+A general resident prefill path should process chunks of at most four tokens.
+Top-4 routing then selects at most 16 unique experts per layer, guaranteed to
+fit the 18-slot resident cache. Chunked resident prefill still needs a batched
+workspace, last-token logits extraction, and full-model parity/performance
+gates before replacing CPU prefill.
+
 ## Phase 4: transfer-queue overlap
 
 Hardware query on the tested RX 6800 XT found:
