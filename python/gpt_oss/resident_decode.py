@@ -150,10 +150,11 @@ def resident_decode_layer(
     current_hidden: int,
     projection,
     expert_store,
-    expert_cache: StreamedResidentMoECache,
+    expert_cache: StreamedResidentMoECache | None,
     position: int,
     sliding_window: int,
-) -> tuple[int, torch.Tensor]:
+    resident_moe=None,
+) -> tuple[int, torch.Tensor | None]:
     """Run one single-token layer with only top-K IDs crossing to CPU."""
     cfg = workspace.cfg
     hidden = cfg.hidden_size
@@ -230,20 +231,44 @@ def resident_decode_layer(
         workspace.router_weights.handle,
         1,
     )
-    global_ids = ext.download_resident_i32(
-        workspace.router_indices, [1, cfg.num_experts_per_tok]
-    ).long()
-    expert_cache.call_resident(
-        layer_idx,
-        expert_store,
-        workspace.post_norm.handle,
-        global_ids,
-        workspace.router_weights.handle,
-        workspace.router_indices,
-        workspace.moe_hidden.handle,
-        workspace.moe_output.handle,
-        1,
-    )
+    if resident_moe is not None:
+        handles = resident_moe.for_layer(layer_idx)
+        ext.moe_mlp_gpt_oss_twostage_io(
+            workspace.post_norm.handle,
+            workspace.router_indices,
+            workspace.router_weights.handle,
+            workspace.moe_hidden.handle,
+            workspace.moe_output.handle,
+            handles.h_gu_blocks,
+            handles.h_gu_scales,
+            handles.h_gu_bias,
+            handles.h_d_blocks,
+            handles.h_d_scales,
+            handles.h_d_bias,
+            handles.E,
+            handles.D,
+            handles.Dff,
+            1,
+            cfg.num_experts_per_tok,
+        )
+        global_ids = None
+    else:
+        if expert_cache is None:
+            raise RuntimeError("resident decode needs a resident expert source")
+        global_ids = ext.download_resident_i32(
+            workspace.router_indices, [1, cfg.num_experts_per_tok]
+        ).long()
+        expert_cache.call_resident(
+            layer_idx,
+            expert_store,
+            workspace.post_norm.handle,
+            global_ids,
+            workspace.router_weights.handle,
+            workspace.router_indices,
+            workspace.moe_hidden.handle,
+            workspace.moe_output.handle,
+            1,
+        )
     ext.add_resident(
         workspace.residual.handle,
         workspace.moe_output.handle,
@@ -282,8 +307,10 @@ def resident_decode_model_step(
             model.streamed_resident,
             position,
             sliding_window,
+            resident_moe=model.resident_moe,
         )
-        all_ids.append(ids)
+        if ids is not None:
+            all_ids.append(ids)
 
     model.ext.rmsnorm_resident(
         workspace.hidden[current].handle,
