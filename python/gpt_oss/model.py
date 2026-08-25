@@ -59,14 +59,16 @@ class GptOssModel:
                 self.ext, self.weights, verbose=verbose
             )
 
-    def enable_streamed_vram_cache(self, slots_per_layer: int = 24) -> None:
+    def enable_streamed_vram_cache(
+        self, slots_per_layer: int = 24, policy: str = "lfu"
+    ) -> None:
         """Cache streamed experts in bounded per-layer VRAM slabs."""
         if self.weights.expert_store is None:
             raise RuntimeError("streamed VRAM cache requires stream_experts=True")
         if self.streamed_resident is None:
             from .streaming_resident import StreamedResidentMoECache
             self.streamed_resident = StreamedResidentMoECache(
-                self.ext, len(self.weights.layers), slots_per_layer
+                self.ext, len(self.weights.layers), slots_per_layer, policy
             )
 
     def pin_lm_head_to_vram(self) -> None:

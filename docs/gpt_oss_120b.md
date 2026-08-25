@@ -93,6 +93,12 @@ the 16-token run. Resident LM head is now enabled by
 default because the faster expert path makes its approximately 7 percent total
 speedup measurable while fitting within the 16 GB budget.
 
+The default eviction policy is LFU with recency tie-breaking. A 48-token trace
+measured 64.8 percent LFU hits versus 61.7 percent for LRU under the same
+24-slot-per-layer VRAM budget. End-to-end time fell from 113.5 seconds with LRU
+to 101.4 seconds with LFU, with identical output tokens. LRU remains available
+through `FREETOKEN_CACHE_POLICY=lru`.
+
 ## Running
 
 Edit paths if needed, then run:
@@ -107,6 +113,7 @@ Optional environment variables:
 FREETOKEN_PROMPT
 FREETOKEN_MAX_NEW
 FREETOKEN_CACHE_SLOTS
+FREETOKEN_CACHE_POLICY
 FREETOKEN_GPU_CACHE
 FREETOKEN_PIN_LM_HEAD
 FREETOKEN_PREFILL_CHUNK
@@ -116,6 +123,7 @@ Recommended defaults:
 
 ```text
 FREETOKEN_CACHE_SLOTS=24
+FREETOKEN_CACHE_POLICY=lfu
 FREETOKEN_GPU_CACHE=1
 FREETOKEN_PIN_LM_HEAD=1
 FREETOKEN_PREFILL_CHUNK=0

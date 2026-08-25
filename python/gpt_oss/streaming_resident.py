@@ -1,7 +1,7 @@
 """Bounded per-layer VRAM cache for streamed gpt-oss experts."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -17,16 +17,28 @@ class _LayerSlab:
     slots: OrderedDict[int, int]
     free_slots: List[int]
     row_bytes: tuple[int, int, int, int, int, int]
+    frequencies: Counter[int]
+    recency: dict[int, int]
+    clock: int
 
 
 class StreamedResidentMoECache:
     """Cache a fixed number of experts per layer in device-local VRAM."""
 
-    def __init__(self, ext, num_layers: int, slots_per_layer: int = 24):
+    def __init__(
+        self,
+        ext,
+        num_layers: int,
+        slots_per_layer: int = 24,
+        policy: str = "lfu",
+    ):
         if slots_per_layer < 4:
             raise ValueError("slots_per_layer must be at least top-K (4)")
+        if policy not in {"lru", "lfu"}:
+            raise ValueError("policy must be 'lru' or 'lfu'")
         self.ext = ext
         self.slots_per_layer = slots_per_layer
+        self.policy = policy
         self.layers: List[Optional[_LayerSlab]] = [None] * num_layers
         self.hits = 0
         self.misses = 0
@@ -66,9 +78,27 @@ class StreamedResidentMoECache:
             slots=OrderedDict(),
             free_slots=list(range(self.slots_per_layer)),
             row_bytes=row_bytes,
+            frequencies=Counter(),
+            recency={},
+            clock=0,
         )
         self.layers[layer_idx] = slab
         return slab
+
+    def _evict(self, slab: _LayerSlab, selected: set[int]) -> int:
+        candidates = [key for key in slab.slots if key not in selected]
+        if not candidates:
+            raise RuntimeError("no cache victim available outside selected experts")
+        if self.policy == "lfu":
+            victim = min(
+                candidates,
+                key=lambda key: (slab.frequencies[key], slab.recency[key]),
+            )
+        else:
+            victim = candidates[0]
+        slot = slab.slots.pop(victim)
+        slab.recency.pop(victim, None)
+        return slot
 
     def call(
         self,
@@ -83,9 +113,6 @@ class StreamedResidentMoECache:
         ids = torch.unique(global_indices.to(torch.int64), sorted=True).tolist()
         store.record_selection(layer_idx, ids)
         if len(ids) > self.slots_per_layer:
-            # Long prefill can select more unique experts than the bounded
-            # decode cache. Use one compact transient invocation, then leave
-            # the decode cache unchanged.
             compact, local_indices = store.materialize_selected(
                 layer_idx, global_indices
             )
@@ -112,6 +139,11 @@ class StreamedResidentMoECache:
                 raise RuntimeError("cannot initialize VRAM slab without an expert")
             slab = self._allocate(layer_idx, loaded[missing[0]])
 
+        for expert_id in ids:
+            slab.clock += 1
+            slab.frequencies[expert_id] += 1
+            slab.recency[expert_id] = slab.clock
+
         selected = set(ids)
         upload_handles: list[int] = []
         upload_tensors: list[torch.Tensor] = []
@@ -120,11 +152,11 @@ class StreamedResidentMoECache:
             if expert_id in slab.slots:
                 slab.slots.move_to_end(expert_id)
                 continue
-            if slab.free_slots:
-                slot = slab.free_slots.pop(0)
-            else:
-                victim = next(key for key in slab.slots if key not in selected)
-                slot = slab.slots.pop(victim)
+            slot = (
+                slab.free_slots.pop(0)
+                if slab.free_slots
+                else self._evict(slab, selected)
+            )
             slab.slots[expert_id] = slot
             expert = loaded[expert_id]
             for handle, tensor, row_bytes in zip(
