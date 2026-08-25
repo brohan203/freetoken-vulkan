@@ -108,8 +108,16 @@ class GptOssModel:
         print(f"[GptOssModel] lm_head pinned in {time.time()-t0:.1f}s")
 
     def pin_all_to_vram(self) -> None:
+        """Pin every model-owned weight group when the checkpoint fits."""
+        self._require_open()
+        if self.weights.expert_store is not None:
+            raise RuntimeError(
+                "streamed-expert models cannot pin every expert; use "
+                "enable_streamed_vram_cache() plus pin_projections_to_vram()"
+            )
         self.pin_moe_to_vram()
         self.pin_lm_head_to_vram()
+        self.pin_projections_to_vram()
 
     def close(self) -> None:
         """Release model-owned resident allocations exactly once."""
