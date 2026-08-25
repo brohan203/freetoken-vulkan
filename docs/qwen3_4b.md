@@ -196,9 +196,22 @@ Measured resident performance:
 This is approximately 27x faster per decode token than the lazy correctness
 path (`2.20 s/token`).
 
+## CLI and long stability
+
+`python/chat_qwen3.py` provides one-shot and interactive resident inference. It
+pins once, reuses one workspace across prompts, reports prompt/decode timing,
+and explicitly frees every resident allocation on exit.
+
+A forced 320-token stability run at max sequence 384 completed with:
+
+- total generation time: `26.67 s`
+- decode average: `0.0809 s/token`
+- steady resident allocation: `8,159,443,584` bytes
+- identical resident bytes before and after generation
+- successful explicit cleanup
+
 ## Next gates
 
-1. Add sustained-generation stability tests.
-2. Add a Qwen3 CLI.
-3. Fuse resident dense-layer submissions for additional decode throughput.
-4. Benchmark longer contexts and workspace capacities.
+1. Fuse resident dense-layer submissions for additional decode throughput.
+2. Benchmark longer contexts and larger workspace capacities.
+3. Add batch-size and continuous-batching support.

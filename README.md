@@ -1,29 +1,40 @@
 # freetoken-vulkan
 
-Run OpenAI's `gpt-oss-20b` on AMD Radeon GPUs via a from-scratch Vulkan compute backend. No CUDA, no ROCm, no Triton.
+Run OpenAI `gpt-oss-20b` / `gpt-oss-120b` and dense `Qwen3-4B` on AMD
+Radeon GPUs through a from-scratch Vulkan compute backend. No CUDA, ROCm, or
+Triton.
 
-Verified end-to-end on a single Radeon RX 6800 XT (16 GB VRAM, RDNA2, Navi 21) at approximately 1.2 seconds per token, with bit-exact correctness against the `transformers` reference on real gpt-oss-20b weights.
+Verified end-to-end on one Radeon RX 6800 XT (16 GB VRAM, RDNA2, Navi 21):
 
-Inspired by [FreeToken](https://github.com/FlashML-org/FreeToken) - which targets NVIDIA/Blackwell via Triton kernels - this repo attacks the same problem from the AMD side by writing every compute kernel as a GLSL compute shader compiled to SPIR-V. Zero source overlap with upstream FreeToken; this is a from-scratch reimplementation of a Vulkan backend, not a fork of the CUDA code.
+- `gpt-oss-20b`: approximately 0.034 s/token resident decode
+- `gpt-oss-120b`: approximately 0.229 s/token resident decode
+- `Qwen3-4B`: approximately 0.081 s/token resident decode
+
+The backend uses GLSL compute shaders compiled to SPIR-V and a minimal C++
+Vulkan runtime. It is inspired by the NVIDIA/Triton-oriented
+[FreeToken](https://github.com/FlashML-org/FreeToken), but this Vulkan backend
+is a from-scratch implementation.
 
 ---
 
 ## What works
 
-- Full `gpt-oss-20b` forward pass - all 24 layers, MXFP4 experts, GQA attention with attention sinks + sliding window, YARN RoPE
-- KV cache (O(1) per new token - verified flat over 64-step decodes)
-- Persistent VRAM residency for MoE expert weights (approximately 9.5 GB) and LM head (approximately 2.2 GB)
-- Buffer pool that eliminates the AMD driver's per-call allocation OOM
-- Long-form generation stability: 320 tokens across 5 prompts with zero errors
-- Bit-exact correctness vs `transformers` reference on every kernel + composed forward pass
+- Full resident `gpt-oss-20b` with all canonical MXFP4 experts pinned
+- Streamed `gpt-oss-120b` with mmap-backed experts and bounded LFU VRAM cache
+- Full resident dense `Qwen3-4B` with native BF16 weights and FP32 accumulation
+- KV-cached generation for all supported models
+- GQA attention, RoPE, RMSNorm, dense SwiGLU, MXFP4 MoE, and attention sinks
+- Explicit model/workspace VRAM lifecycle with exact cleanup tests
+- 320-token stability gates for 20b, 120b, and Qwen3-4B
+- Token parity against Transformers on verified generation prompts
 
-## What's honest
+## Current limits
 
-- Approximately 1.2 s/token on a 6800 XT. That's about 50 tok/min. Fine for a demo, not chatbot-fast.
-- Windows-only. Nothing platform-specific in the shader code; a Linux port would take an afternoon of build-system work.
-- Single-token batching only. No request queue, no continuous batching, no multi-user server.
-- Model download not automated (see below).
-- Perf is bounded at approximately 18 ms per Vulkan submit-wait on this hardware/driver. Getting below that requires a batched-submit refactor (activations stay in VRAM across kernels) that has not been built yet.
+- Windows build and test path; shaders themselves are not Windows-specific
+- Batch size one and no continuous batching or multi-user server
+- Model downloads are manual
+- Qwen3-4B resident startup pins about 7.5 GiB of weights before inference
+- `gpt-oss-120b` remains bounded by expert-cache misses and PCIe uploads
 
 ## Hardware requirements
 
@@ -70,6 +81,10 @@ python\chat_gpt_oss.py --model-dir C:\path\to\gpt-oss-120b \
     --max-new-tokens 48 "The capital of France is"
 
 # Omit the prompt to start an interactive loop.
+
+# Dense Qwen3-4B resident loop:
+python\chat_qwen3.py --model-dir C:\path\to\Qwen3-4B \
+    --max-new-tokens 48 "The capital of France is"
 ```
 
 Resident decode is the default: the model, FP32 LM head, all 36 layers of
