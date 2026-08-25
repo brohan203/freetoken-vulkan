@@ -1,4 +1,4 @@
-// ext_module.cpp — Vulkan compute backend exposed as PyTorch custom ops.
+// ext_module.cpp - Vulkan compute backend exposed as PyTorch custom ops.
 //
 // Extends the RMSNorm POC to the full set of ops used by our transformer
 // demos: matmul (reg_tiled), softmax, flash_attention, swiglu, moe_router,
@@ -30,7 +30,7 @@ static vku::Context& get_ctx() {
     return ctx;
 }
 
-// Shader dir — env-var configurable so tests can point at a build/ folder.
+// Shader dir - env-var configurable so tests can point at a build/ folder.
 static std::string shader_path(const char* shader_name) {
     const char* env = std::getenv("FREETOKEN_VULKAN_SHADERS");
     if (env) return std::string(env) + "/" + shader_name;
@@ -91,6 +91,56 @@ int64_t upload_resident_vulkan(torch::Tensor t) {
     const int64_t h = g_next_handle++;
     g_resident.emplace(h, buf);
     return h;
+}
+
+int64_t allocate_resident_vulkan(int64_t bytes) {
+    TORCH_CHECK(bytes > 0, "resident allocation size must be positive");
+    auto& ctx = get_ctx();
+    vku::Buffer buf = vku::make_device_ssbo(ctx, (VkDeviceSize)bytes);
+    const int64_t h = g_next_handle++;
+    g_resident.emplace(h, buf);
+    return h;
+}
+
+void upload_resident_batch_vulkan(
+    const std::vector<int64_t>& handles,
+    const std::vector<torch::Tensor>& tensors,
+    const std::vector<int64_t>& offsets) {
+    TORCH_CHECK(handles.size() == tensors.size(), "handles/tensors size mismatch");
+    TORCH_CHECK(handles.size() == offsets.size(), "handles/offsets size mismatch");
+    if (handles.empty()) return;
+
+    auto& ctx = get_ctx();
+    std::vector<torch::Tensor> contiguous;
+    std::vector<vku::Buffer> staging;
+    contiguous.reserve(tensors.size());
+    staging.reserve(tensors.size());
+
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        TORCH_CHECK(tensors[i].device().is_cpu(), "resident upload tensor must be on CPU");
+        TORCH_CHECK(offsets[i] >= 0, "resident upload offset must be non-negative");
+        auto it = g_resident.find(handles[i]);
+        TORCH_CHECK(it != g_resident.end(), "resident buffer handle not found: ", handles[i]);
+        contiguous.push_back(tensors[i].contiguous());
+        const size_t bytes = (size_t)contiguous.back().numel() * contiguous.back().element_size();
+        TORCH_CHECK((size_t)offsets[i] + bytes <= (size_t)it->second.size,
+                    "resident batch upload exceeds destination capacity");
+        staging.push_back(vku::make_host_ssbo(ctx, bytes));
+        vku::upload(ctx, staging.back(), contiguous.back().data_ptr(), bytes);
+    }
+
+    vku::submit_and_wait(ctx, [&](VkCommandBuffer cmd) {
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const size_t bytes = (size_t)contiguous[i].numel() * contiguous[i].element_size();
+            VkBufferCopy copy{};
+            copy.srcOffset = 0;
+            copy.dstOffset = (VkDeviceSize)offsets[i];
+            copy.size = (VkDeviceSize)bytes;
+            vkCmdCopyBuffer(cmd, staging[i].buf, g_resident.at(handles[i]).buf, 1, &copy);
+        }
+    });
+
+    for (auto& buffer : staging) vku::destroy_buffer(ctx, buffer);
 }
 
 void free_resident_vulkan(int64_t handle) {
@@ -166,7 +216,7 @@ static KernelPipeline& get_pipeline(const std::string& shader_name,
 //
 // Perf: caches a global VkDescriptorPool (up to kDescPoolMaxSets sets)
 // and resets it when full. This saves the vkCreateDescriptorPool /
-// vkDestroyDescriptorPool round-trip per kernel call — ~100-500 us each,
+// vkDestroyDescriptorPool round-trip per kernel call - ~100-500 us each,
 // which was measured to dominate MoE decode-step time.
 // ============================================================
 static constexpr uint32_t kDescPoolMaxSets = 4096;
@@ -426,7 +476,7 @@ torch::Tensor flash_attention_mh_vulkan(torch::Tensor Q, torch::Tensor K,
 }
 
 // ============================================================
-// Op 4c: gpt-oss FlashAttention — MH + GQA + causal + sliding window + sinks.
+// Op 4c: gpt-oss FlashAttention - MH + GQA + causal + sliding window + sinks.
 // Q [B, H_q, S, D], K, V [B, H_kv, S, D], sinks [H_q].
 // ============================================================
 torch::Tensor flash_attention_gpt_oss_vulkan(
@@ -492,7 +542,7 @@ torch::Tensor flash_attention_gpt_oss_vulkan(
 }
 
 // ============================================================
-// Op 4d: gpt-oss FlashAttention with KV cache — S_q may differ from S_kv,
+// Op 4d: gpt-oss FlashAttention with KV cache - S_q may differ from S_kv,
 // past_len is the absolute position of the first Q token.
 // ============================================================
 torch::Tensor flash_attention_gpt_oss_kv_vulkan(
@@ -699,7 +749,7 @@ void moe_mlp_gpt_oss_resident_bench_vulkan(
     for (int64_t i = 0; i < N; ++i) {
         run_kernel(pipe, vbufs, &pc, (uint32_t)T, 1, 1);
     }
-    // Discard output — this is a benchmark.
+    // Discard output - this is a benchmark.
 }
 
 // ============================================================
@@ -732,7 +782,7 @@ torch::Tensor swiglu_vulkan(torch::Tensor gate, torch::Tensor up) {
 }
 
 // ============================================================
-// Op 6: MoE router — top-K softmax + renormalized weights.
+// Op 6: MoE router - top-K softmax + renormalized weights.
 // ============================================================
 std::tuple<torch::Tensor, torch::Tensor>
 moe_router_vulkan(torch::Tensor logits, int64_t K) {
@@ -767,7 +817,7 @@ moe_router_vulkan(torch::Tensor logits, int64_t K) {
 }
 
 // ============================================================
-// Op 7: MoE MLP — fused per-token routed SwiGLU MLP.
+// Op 7: MoE MLP - fused per-token routed SwiGLU MLP.
 // ============================================================
 static torch::Tensor moe_mlp_impl(torch::Tensor x, torch::Tensor indices,
                                    torch::Tensor weights,
@@ -827,7 +877,7 @@ static torch::Tensor moe_mlp_impl(torch::Tensor x, torch::Tensor indices,
     return y;
 }
 
-// Small-shape MoE MLP (D ≤ 256, Dff ≤ 512).
+// Small-shape MoE MLP (D <= 256, Dff <= 512).
 torch::Tensor moe_mlp_vulkan(torch::Tensor x, torch::Tensor indices,
                               torch::Tensor weights,
                               torch::Tensor W_gate, torch::Tensor W_up,
@@ -836,7 +886,7 @@ torch::Tensor moe_mlp_vulkan(torch::Tensor x, torch::Tensor indices,
                         "moe_mlp_f32.comp.spv");
 }
 
-// Large-shape MoE MLP (D ≤ 4096, Dff up to any). Handles real Phi-3.5-MoE
+// Large-shape MoE MLP (D <= 4096, Dff up to any). Handles real Phi-3.5-MoE
 // shape (D=4096, Dff=6400) via Dff blocking. See moe_mlp_lg_f32.comp.
 torch::Tensor moe_mlp_lg_vulkan(torch::Tensor x, torch::Tensor indices,
                                  torch::Tensor weights,
@@ -847,7 +897,7 @@ torch::Tensor moe_mlp_lg_vulkan(torch::Tensor x, torch::Tensor indices,
 }
 
 // ============================================================
-// Op: MXFP4 matvec — y[j] = sum_i W[j, i] * x[i]
+// Op: MXFP4 matvec - y[j] = sum_i W[j, i] * x[i]
 // W stored as MXFP4 (blocks uint8 + scales uint8, block_size=32).
 // Foundation kernel for gpt-oss MoE experts.
 // ============================================================
@@ -1069,7 +1119,7 @@ torch::Tensor moe_mlp_gpt_oss_resident_vulkan(
 // pybind11 module.
 // ============================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FreeToken Vulkan compute backend — full op set.";
+    m.doc() = "FreeToken Vulkan compute backend - full op set.";
     m.def("rmsnorm", &rmsnorm_vulkan, "Rowwise RMSNorm on Vulkan.",
           py::arg("x"), py::arg("weight"), py::arg("eps") = 1e-6);
     m.def("matmul",  &matmul_vulkan,  "2D matmul on Vulkan (reg_tiled f32).",
@@ -1122,7 +1172,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x"), py::arg("indices"), py::arg("weights"),
           py::arg("W_gate"), py::arg("W_up"), py::arg("W_down"));
     m.def("mxfp4_matvec", &mxfp4_matvec_vulkan,
-          "MXFP4-weight × FP32-activation matvec: y[j] = <W[j, :], x>. "
+          "MXFP4-weight x FP32-activation matvec: y[j] = <W[j, :], x>. "
           "blocks [M, NB, 16] uint8, scales [M, NB] uint8, x [K=NB*32] fp32, "
           "returns y [M] fp32.",
           py::arg("blocks"), py::arg("scales"), py::arg("x"));
@@ -1137,6 +1187,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Upload a CPU tensor to VRAM as a persistent buffer. Returns an "
           "int64 handle usable in the *_resident variants of ops.",
           py::arg("tensor"));
+    m.def("allocate_resident", &allocate_resident_vulkan,
+          "Allocate an uninitialized device-local resident buffer.",
+          py::arg("bytes"));
+    m.def("upload_resident_batch", &upload_resident_batch_vulkan,
+          "Upload CPU tensors into resident-buffer subranges in one submit.",
+          py::arg("handles"), py::arg("tensors"), py::arg("offsets"));
     m.def("free_resident", &free_resident_vulkan,
           "Free the persistent buffer identified by handle. No-op if unknown.",
           py::arg("handle"));

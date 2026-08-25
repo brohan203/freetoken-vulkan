@@ -1,4 +1,4 @@
-"""GptOssConfig — dataclass mirroring the fields we need from config.json."""
+"""GptOssConfig - dataclass mirroring the fields we need from config.json."""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
@@ -42,8 +42,9 @@ class GptOssConfig:
     def from_json(cls, path: str | pathlib.Path) -> "GptOssConfig":
         with open(path) as f:
             j = json.load(f)
-        # Some fields have alternate names — normalize.
-        num_experts = j.get("num_experts") or j.get("num_local_experts") or j.get("n_experts")
+        # Some fields have alternate names - normalize.
+        num_experts = (j.get("num_experts") or j.get("num_local_experts")
+                       or j.get("n_experts"))
         top_k = j.get("num_experts_per_tok") or j.get("experts_per_token") or j.get("top_k")
         return cls(
             hidden_size=j["hidden_size"],

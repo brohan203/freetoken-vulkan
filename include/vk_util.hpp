@@ -1,12 +1,12 @@
 #pragma once
-// vk_util.hpp — tiny header-only Vulkan compute utility layer.
+// vk_util.hpp - tiny header-only Vulkan compute utility layer.
 //
 // vector_add.cpp shows every step raw. Every subsequent kernel would drown
 // in the same 200 lines of boilerplate, so we lift instance/device/queue/
 // buffer/shader creation into this header. Kernel .cpp files then focus on
 // the kernel-specific bits: descriptor layout, push constants, dispatch.
 //
-// Deliberately minimal — no exceptions, no RAII wrappers, no CRTP. Read it
+// Deliberately minimal - no exceptions, no RAII wrappers, no CRTP. Read it
 // top-to-bottom and every line maps to a Vulkan call you already saw in
 // vector_add.cpp.
 
@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <chrono>
 #include <fstream>
+#include <stdexcept>
 #include <vector>
 
 namespace vku {
@@ -26,7 +27,7 @@ namespace vku {
     std::exit(1); } } while (0)
 
 // ============================================================
-// Context — everything you need once, kept around for the whole run.
+// Context - everything you need once, kept around for the whole run.
 // ============================================================
 struct Context {
     VkInstance                 instance         = VK_NULL_HANDLE;
@@ -49,7 +50,7 @@ inline Context create_context() {
     ii.pApplicationInfo = &app;
     VKU_CHECK(vkCreateInstance(&ii, nullptr, &ctx.instance));
 
-    // Pick a physical device — prefer discrete.
+    // Pick a physical device - prefer discrete.
     uint32_t n = 0;
     VKU_CHECK(vkEnumeratePhysicalDevices(ctx.instance, &n, nullptr));
     if (n == 0) { std::fprintf(stderr, "no Vulkan GPU\n"); std::exit(1); }
@@ -75,8 +76,8 @@ inline Context create_context() {
     }
     if (ctx.queue_family == UINT32_MAX) { std::fprintf(stderr, "no compute queue\n"); std::exit(1); }
 
-    // Enable FP16 + INT8 features. Chain: Vulkan11Features (16-bit storage) →
-    // Vulkan12Features (shaderFloat16 + shaderInt8 + 8-bit storage) → attached
+    // Enable FP16 + INT8 features. Chain: Vulkan11Features (16-bit storage) ->
+    // Vulkan12Features (shaderFloat16 + shaderInt8 + 8-bit storage) -> attached
     // to DeviceCreateInfo.pNext. 6800 XT / RDNA2 supports all four.
     // Int8 + 8-bit storage are needed for MXFP4/NVFP4 packed weights (uint8
     // blocks + uint8 scales).
@@ -167,7 +168,7 @@ inline void destroy_buffer(const Context& ctx, Buffer& b) {
     b = {};
 }
 
-// Host-visible+coherent shortcut — good enough for correctness testing.
+// Host-visible+coherent shortcut - good enough for correctness testing.
 // Real perf work will use device-local + staging buffers.
 inline Buffer make_host_ssbo(const Context& ctx, VkDeviceSize size) {
     return make_buffer(ctx, size,
@@ -200,6 +201,7 @@ inline Buffer make_device_ssbo(const Context& ctx, VkDeviceSize size) {
 //
 // - Growth-only (never returns memory to the OS while the pool is alive)
 // - Bucket boundaries are powers of 2 from 4 KiB up to 512 MiB
+// - Oversized requests receive an exact-size unpooled allocation
 // - Caps the free list per bucket to avoid unbounded growth of small buffers
 // ============================================================
 struct BufferPool {
@@ -228,7 +230,14 @@ struct BufferPool {
         return cap;
     }
 
+    static size_t max_bucket_size() {
+        return bucket_size(kNumBuckets - 1);
+    }
+
     Buffer acquire_host(size_t bytes) {
+        if (bytes > max_bucket_size()) {
+            return make_host_ssbo(*ctx, bytes);
+        }
         uint32_t idx = bucket_of(bytes);
         auto& bucket = host_pool[idx];
         if (!bucket.empty()) {
@@ -241,6 +250,10 @@ struct BufferPool {
 
     void release_host(Buffer& b) {
         if (!b.buf) return;
+        if ((size_t)b.size > max_bucket_size()) {
+            destroy_buffer(*ctx, b);
+            return;
+        }
         uint32_t idx = bucket_of((size_t)b.size);
         auto& bucket = host_pool[idx];
         if (bucket.size() < kMaxPerBucket) {
@@ -268,6 +281,9 @@ struct BufferPool {
 };
 
 inline void upload(const Context& ctx, Buffer& b, const void* src, VkDeviceSize bytes) {
+    if (bytes > b.size) {
+        throw std::runtime_error("upload exceeds Vulkan buffer capacity");
+    }
     void* p;
     VKU_CHECK(vkMapMemory(ctx.device, b.mem, 0, bytes, 0, &p));
     std::memcpy(p, src, (size_t)bytes);
@@ -275,6 +291,9 @@ inline void upload(const Context& ctx, Buffer& b, const void* src, VkDeviceSize 
 }
 
 inline void download(const Context& ctx, Buffer& b, void* dst, VkDeviceSize bytes) {
+    if (bytes > b.size) {
+        throw std::runtime_error("download exceeds Vulkan buffer capacity");
+    }
     void* p;
     VKU_CHECK(vkMapMemory(ctx.device, b.mem, 0, bytes, 0, &p));
     std::memcpy(dst, p, (size_t)bytes);
@@ -343,10 +362,10 @@ inline VkShaderModule make_shader_module(VkDevice dev, const std::vector<uint32_
 }
 
 // ============================================================
-// One-shot command buffer helper — begin, record via callback, submit, wait.
+// One-shot command buffer helper - begin, record via callback, submit, wait.
 // Returns wall-clock ms of the queue submit+wait.
 // ============================================================
-// Reusable resources for submit_and_wait — allocated once, reused across
+// Reusable resources for submit_and_wait - allocated once, reused across
 // every kernel call. Skipping vkAllocateCommandBuffers / vkFreeCommandBuffers
 // each call is worth ~50-200 us; using a fence instead of vkQueueWaitIdle
 // avoids draining the whole queue.
@@ -396,7 +415,7 @@ inline double submit_and_wait(const Context& ctx, Fn record) {
     // On Windows AMD, vkWaitForFences appears to sleep+wake on the OS
     // scheduler tick (~15.6 ms), turning even microsecond-fast GPU
     // dispatches into ~18 ms round-trips. Busy-polling avoids that at
-    // the cost of a hot CPU thread — fine for our per-call overhead.
+    // the cost of a hot CPU thread - fine for our per-call overhead.
     while (true) {
         VkResult r = vkGetFenceStatus(ctx.device, fence);
         if (r == VK_SUCCESS) break;
@@ -410,7 +429,7 @@ inline double submit_and_wait(const Context& ctx, Fn record) {
 }
 
 // ============================================================
-// GPU timestamp helper — measures actual on-GPU compute time via
+// GPU timestamp helper - measures actual on-GPU compute time via
 // VkQueryPool, separate from queue submission + wait overhead.
 //
 // Usage:
@@ -485,7 +504,7 @@ inline double read_gpu_ms(const Context& ctx, const TimestampQuery& ts) {
         sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
     const uint64_t delta_ticks = stamps[1] - stamps[0];
     const double   delta_ns    = (double)delta_ticks * ts.timestamp_period_ns;
-    return delta_ns / 1.0e6;   // ns → ms
+    return delta_ns / 1.0e6;   // ns -> ms
 }
 
 } // namespace vku

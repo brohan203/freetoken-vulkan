@@ -53,7 +53,8 @@ def greedy_generate(model, tokenizer, prompt: str, max_new_tokens: int = 20,
 def greedy_generate_kv(model, tokenizer, prompt: str,
                        max_new_tokens: int = 20,
                        max_seqlen: int | None = None,
-                       print_stream: bool = True
+                       print_stream: bool = True,
+                       prefill_chunk_size: int | None = None,
                        ) -> Tuple[str, list[int], dict]:
     """Returns (full_text, new_token_ids, stats). stats includes:
         prefill_time, decode_times (list per token), total_time.
@@ -66,9 +67,22 @@ def greedy_generate_kv(model, tokenizer, prompt: str,
 
     # ---- Prefill ----
     t_pre = time.time()
-    logits = model.forward(input_ids, past_kv=cache, past_len=0,
-                            only_last_logits=True)
-    cache.advance(S_prompt)
+    if prefill_chunk_size is None or prefill_chunk_size >= S_prompt:
+        logits = model.forward(input_ids, past_kv=cache, past_len=0,
+                               only_last_logits=True)
+        cache.advance(S_prompt)
+    else:
+        logits = None
+        for start in range(0, S_prompt, prefill_chunk_size):
+            chunk = input_ids[:, start:start + prefill_chunk_size]
+            logits = model.forward(
+                chunk,
+                past_kv=cache,
+                past_len=cache.cur_len,
+                only_last_logits=True,
+            )
+            cache.advance(chunk.shape[1])
+        assert logits is not None
     prefill_time = time.time() - t_pre
 
     next_id = int(logits[0, -1].argmax().item())
@@ -113,6 +127,7 @@ def greedy_generate_kv(model, tokenizer, prompt: str,
         "decode_times": decode_times,
         "num_prompt_tokens": S_prompt,
         "num_new_tokens": len(new_ids),
+        "prefill_chunk_size": prefill_chunk_size,
     }
     return text, new_ids, stats
 
