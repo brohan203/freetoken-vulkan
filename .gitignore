@@ -42,9 +42,9 @@ _*_out.log
 *.log
 
 # Downloaded model weights (kept outside the repo)
-gpt-oss-*/
-Qwen*/
-DeepSeek*/
+/gpt-oss-*/
+/Qwen*/
+/DeepSeek*/
 
 # IDE / editor
 .vscode/

@@ -198,6 +198,18 @@ void transpose_resident_vulkan(int64_t src_handle, int64_t dst_handle,
                &pc, groups, 1, 1);
 }
 
+void swiglu_resident_vulkan(int64_t gate_handle, int64_t up_handle,
+                            int64_t out_handle, int64_t elements) {
+    TORCH_CHECK(elements > 0, "resident SwiGLU size must be positive");
+    auto& pipe = get_pipeline("swiglu_f32.comp.spv", 3, 4);
+    struct PC { uint32_t n; } pc{(uint32_t)elements};
+    run_kernel(
+        pipe,
+        {resident_buf(gate_handle), resident_buf(up_handle),
+         resident_buf(out_handle)},
+        &pc, (uint32_t)((elements + 255) / 256), 1, 1);
+}
+
 void add_resident_vulkan(int64_t a_handle, int64_t b_handle,
                          int64_t out_handle, int64_t elements) {
     TORCH_CHECK(elements > 0, "resident add element count must be positive");
@@ -1653,6 +1665,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("src_handle"), py::arg("dst_handle"),
           py::arg("S"), py::arg("H"), py::arg("D"),
           py::arg("inverse") = false);
+    m.def("swiglu_resident", &swiglu_resident_vulkan,
+          "Resident FP32 SwiGLU activation.",
+          py::arg("gate_handle"), py::arg("up_handle"),
+          py::arg("out_handle"), py::arg("elements"));
     m.def("add_resident", &add_resident_vulkan,
           "Elementwise add of resident FP32 buffers.",
           py::arg("a_handle"), py::arg("b_handle"),

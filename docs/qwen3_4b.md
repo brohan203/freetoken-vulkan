@@ -148,10 +148,28 @@ A real layer-0 Q projection (`4096 x 2560`) was compared with CPU FP32:
 
 This primitive makes full Qwen3-4B weight residency feasible within 16 GiB.
 
+## Resident dense layer
+
+The first fully resident Qwen3 decode layer now uses:
+
+- native BF16 Q/K/V/O/gate/up/down weights
+- FP32 global and per-head RMSNorm
+- resident full RoPE and KV append
+- resident grouped-query attention
+- resident SwiGLU
+- resident residuals and outputs
+
+A real layer-0 decode step compared with the verified cached path produced:
+
+- maximum absolute error: `1.431e-6`
+- mean absolute error: `9.456e-8`
+- one-layer weights/workspace/KV resident allocation: `206,841,984` bytes
+- resident bytes after explicit free: exactly zero
+
 ## Next gates
 
-1. Pin Qwen3 BF16 weights plus FP32 norm vectors resident.
-2. Build a fully resident single-token dense layer.
-3. Compare resident decode against the verified cached path.
+1. Pin all 36 Qwen3 layers in native BF16.
+2. Add resident final norm and tied LM head.
+3. Compare resident full-model decode against verified generation.
 4. Add sustained-generation stability tests.
 5. Add a Qwen3 CLI after resident decode is verified.
