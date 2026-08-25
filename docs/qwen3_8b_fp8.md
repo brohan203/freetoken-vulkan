@@ -90,8 +90,25 @@ A forced 320-token run at max sequence 384 completed with:
 - identical resident bytes before and after generation
 - successful explicit cleanup
 
+## CLI
+
+The shared Qwen CLI accepts the 8B FP8 checkpoint directly:
+
+```powershell
+python\chat_qwen3.py \
+    --model-dir C:\path\to\Qwen3-8B-FP8 \
+    --max-new-tokens 48 "The capital of France is"
+```
+
+Verified CLI smoke:
+
+- pin: `9.34 s`
+- resident allocation reported: `8.90 GiB`
+- prompt/decode output: `The capital of France is Paris.`
+- prompt processing: `0.047 s/token`
+- decode: `0.042 s/token`
+
 ## Next gates
 
-1. Add explicit Qwen3-8B-FP8 CLI examples.
-2. Benchmark larger context capacities.
-3. Add batch-size and continuous-batching support.
+1. Benchmark larger context capacities.
+2. Add batch-size and continuous-batching support.
