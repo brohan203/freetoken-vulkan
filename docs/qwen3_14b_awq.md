@@ -49,10 +49,22 @@ A real layer-0 Q projection produced:
 - mean error: `8.208e-9`
 - finite FP32 output
 
+## Lazy dense-layer loader
+
+The shared Qwen loader now recognizes AWQ matrix triplets, unpacks them with the
+verified nibble order, applies group-128 scales/zeros, and transposes AWQ's
+`[input, output]` layout into the dense runtime's `[output, input]` contract.
+
+One full real Qwen3-14B-AWQ layer compared with an independent PyTorch reference:
+
+- output shape `[1, 3, 5120]`
+- maximum absolute error: `2.861e-6`
+- mean absolute error: `5.223e-8`
+- finite output
+
 ## Next gates
 
-1. Add AWQ matrix handles to the shared Qwen loader/resident manager.
-2. Validate one full 14B layer.
-3. Pin all 40 layers resident.
+1. Add AWQ matrix handles to the resident manager.
+2. Pin all 40 layers resident.
 4. Run full-model and generation parity.
 5. Add long-context stability and CLI examples.
