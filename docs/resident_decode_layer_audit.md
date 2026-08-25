@@ -62,12 +62,18 @@ The tuned 120b baseline already consumes approximately:
 - resident FP32 LM head: about 2.16 GiB;
 - KV cache and transient buffers: remaining headroom.
 
-Pinning all 36 layers of FP32 Q/K/V/O/router weights is not viable. Projection
-weights need one of:
+All 36 layers of FP32 Q/K/V/O/router plus norm/bias/sink weights total 3.61
+GiB. They do not fit alongside 24 expert slots/layer and the FP32 LM head, but
+they do fit after reducing the expert cache to 18 slots:
 
-1. a bounded layer-weight cache;
-2. BF16 resident shaders after a verified bit-layout test;
-3. per-layer staging into reusable device-local projection buffers.
+- FP32 LM head: 2.16 GiB;
+- all FP32 projection/norm/router/sink weights: 3.61 GiB;
+- 18 expert slots/layer plus runtime buffers: final measured resident total
+  13.77 GiB after a two-token `Hello, World` smoke test.
+
+`ResidentProjectionWeights` uploads all 36 layers once. The 18-slot expert
+cache has a modest miss-rate penalty, acceptable if one-submit resident layers
+recover more than the additional expert-upload time.
 
 ## Dispatch guard
 
