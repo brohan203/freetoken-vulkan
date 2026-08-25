@@ -16,6 +16,7 @@ def greedy_generate_resident(
     max_new_tokens: int = 48,
     max_seqlen: int = 256,
     print_stream: bool = True,
+    workspace: ResidentDecodeWorkspace | None = None,
 ):
     """Generate greedily with CPU prefill and GPU-resident decode."""
     if model.resident_projections is None or model.h_lm_head is None:
@@ -41,9 +42,13 @@ def greedy_generate_resident(
     cache.advance(prompt_length)
     prefill_time = time.time() - prefill_started
 
-    workspace = ResidentDecodeWorkspace(
-        model.ext, model.cfg, model.cfg.num_hidden_layers, max_seqlen
-    )
+    owns_workspace = workspace is None
+    if workspace is None:
+        workspace = ResidentDecodeWorkspace(
+            model.ext, model.cfg, model.cfg.num_hidden_layers, max_seqlen
+        )
+    elif workspace.capacity != max_seqlen:
+        raise ValueError("reused workspace capacity must match max_seqlen")
     workspace.load_kv_cache(cache)
     next_id = int(logits[0, -1].argmax())
     new_ids = [next_id]
@@ -76,7 +81,8 @@ def greedy_generate_resident(
             if eos is not None and next_id == eos:
                 break
     finally:
-        workspace.free()
+        if owns_workspace:
+            workspace.free()
 
     if print_stream:
         print()

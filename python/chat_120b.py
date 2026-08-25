@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 
 from gpt_oss import GptOssModel, greedy_generate_resident
 from gpt_oss.generate import greedy_generate_kv
+from gpt_oss.resident_decode import ResidentDecodeWorkspace
 
 
 def build_model(
@@ -60,6 +61,7 @@ def run_prompt(
     max_new: int,
     max_seq: int,
     resident_decode: bool,
+    workspace: ResidentDecodeWorkspace | None = None,
 ):
     hits_before = model.streamed_resident.hits
     misses_before = model.streamed_resident.misses
@@ -72,6 +74,7 @@ def run_prompt(
         max_new_tokens=max_new,
         max_seqlen=max_seq,
         print_stream=True,
+        **({"workspace": workspace} if resident_decode else {}),
     )
     elapsed = time.perf_counter() - started
     hits = model.streamed_resident.hits - hits_before
@@ -111,36 +114,44 @@ def main() -> None:
     model, tokenizer = build_model(
         args.model_dir, args.slots, args.threads, resident_decode
     )
+    workspace = (
+        ResidentDecodeWorkspace(
+            model.ext, model.cfg, model.cfg.num_hidden_layers,
+            args.max_seq_len,
+        )
+        if resident_decode
+        else None
+    )
 
     if args.prompt is not None:
-        run_prompt(
-            model,
-            tokenizer,
-            args.prompt,
-            args.max_new_tokens,
-            args.max_seq_len,
-            resident_decode,
-        )
+        try:
+            run_prompt(
+                model, tokenizer, args.prompt, args.max_new_tokens,
+                args.max_seq_len, resident_decode, workspace,
+            )
+        finally:
+            if workspace is not None:
+                workspace.free()
         return
 
     mode = "resident" if resident_decode else "legacy"
     print(f"gpt-oss-120b ready ({mode} decode). Empty line exits.")
-    while True:
-        try:
-            prompt = input("\nprompt> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not prompt:
-            break
-        run_prompt(
-            model,
-            tokenizer,
-            prompt,
-            args.max_new_tokens,
-            args.max_seq_len,
-            resident_decode,
-        )
-
-
+    mode = "resident" if resident_decode else "legacy"
+    print(f"gpt-oss-120b ready ({mode} decode). Empty line exits.")
+    try:
+        while True:
+            try:
+                prompt = input("\nprompt> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not prompt:
+                break
+            run_prompt(
+                model, tokenizer, prompt, args.max_new_tokens,
+                args.max_seq_len, resident_decode, workspace,
+            )
+    finally:
+        if workspace is not None:
+            workspace.free()
 if __name__ == "__main__":
     main()

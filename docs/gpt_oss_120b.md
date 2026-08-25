@@ -132,9 +132,11 @@ FREETOKEN_CPU_THREADS
 
 For repeated prompts, `python/chat_120b.py` keeps the model and expert cache
 alive across requests. In a measured four-request sequence, the first
-`The capital of France is` request took about 10.0 seconds; repeating the same
-prompt later in the process took about 6.2 seconds. Prefill fell from 3.66 to
-0.99 seconds and cache hit rate rose from 53.5 to 66.8 percent.
+`The capital of France is` request generated 16 tokens in 11.70 seconds;
+repeating the identical prompt later in the same resident workspace took 4.39
+seconds with exactly the same token IDs. Prefill fell from 4.95 to 1.09 seconds
+and decode fell from 0.447 to 0.218 seconds/token as the expert cache warmed and
+resident activation/KV allocations were reused.
 
 Recommended defaults:
 
