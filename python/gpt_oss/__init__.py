@@ -19,6 +19,7 @@ from .resident_tensor import ResidentTensor
 from .resident_projections import (
     ResidentProjectionLayer, ResidentProjectionWeights,
 )
+from .resident_session import ResidentDecodeSession
 from .rope import compute_cos_sin_for_positions
 from .streaming_resident import StreamedResidentMoECache
 
@@ -41,6 +42,7 @@ __all__ = [
     "ResidentTensor",
     "ResidentProjectionLayer",
     "ResidentProjectionWeights",
+    "ResidentDecodeSession",
     "compute_cos_sin_for_positions",
     "StreamedResidentMoECache",
 ]

@@ -76,6 +76,11 @@ Repeated prompts are significantly faster because both the resident workspace
 and expert cache stay warm. A measured 16-token prompt fell from 11.70 seconds
 to 4.39 seconds on an identical repeat, with exactly the same token IDs.
 
+For protocol-controlled incremental context, `ResidentDecodeSession` preserves
+resident KV state and accepts exact token-ID appends. The checkpoint tokenizer
+has no canonical `chat_template`, so the library intentionally does not invent
+user/assistant formatting.
+
 ## Sample output - real, from `demo_long_gen.py`
 
 Prompt: `"def fibonacci(n):"`

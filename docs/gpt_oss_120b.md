@@ -169,6 +169,17 @@ reduced runtime from 32.7 to 15.8 seconds in the final cold-run matrix. A
 320-token stress generated all 320 tokens with resident allocation unchanged at
 14,782,134,528 bytes.
 
+## Incremental token-ID sessions
+
+`ResidentDecodeSession` preserves resident KV state across generation calls and
+supports exact token-ID appends. Validation proved that `generate(2)` followed
+by another `generate(2)` exactly matches `generate(4)`, and that the next token
+after appending caller-provided IDs matches a full-context recomputation.
+
+The tokenizer checkpoint does not define a canonical `chat_template`. Session
+callers must therefore own Harmony or other protocol formatting instead of
+relying on an invented user/assistant template.
+
 ## Known limits
 
 - Decode is PCIe/disk expert-miss bound, not shader-compute bound.
