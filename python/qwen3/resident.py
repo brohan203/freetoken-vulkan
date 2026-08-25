@@ -291,40 +291,33 @@ def _resident_qwen3_layer_awq(
 ) -> int:
     cfg = workspace.config
     output_slot = 1 - input_slot
-    x, out = workspace.hidden[input_slot], workspace.hidden[output_slot]
-    d, hd = cfg.hidden_size, cfg.head_dim
-    hq, hkv = cfg.num_attention_heads, cfg.num_key_value_heads
-
-    def linear(source, weight, zero, scale, target, n_size, k_size):
-        ext.linear_awq4_twostage_resident_io(
-            source.handle, weight, zero, scale,
-            workspace.awq_partials.handle, target.handle,
-            n_size, k_size, 128,
-        )
-
-    ext.rmsnorm_resident(x.handle, weights.input_norm, workspace.normalized.handle, 1, d, cfg.rms_norm_eps)
-    linear(workspace.normalized, weights.q_weight, weights.q_zero, weights.q_scale, workspace.q, cfg.query_size, d)
-    linear(workspace.normalized, weights.k_weight, weights.k_zero, weights.k_scale, workspace.k, cfg.kv_size, d)
-    linear(workspace.normalized, weights.v_weight, weights.v_zero, weights.v_scale, workspace.v, cfg.kv_size, d)
-    ext.rmsnorm_resident(workspace.q.handle, weights.q_norm, workspace.q.handle, hq, hd, cfg.rms_norm_eps)
-    ext.rmsnorm_resident(workspace.k.handle, weights.k_norm, workspace.k.handle, hkv, hd, cfg.rms_norm_eps)
-    ext.rope_kv_attention_resident(
-        workspace.q.handle, workspace.k.handle, workspace.v.handle,
+    ext.qwen3_decode_layer_awq_twostage_resident(
+        workspace.hidden[input_slot].handle,
+        weights.input_norm, workspace.normalized.handle,
+        weights.q_weight, weights.q_zero, weights.q_scale, workspace.q.handle,
+        weights.k_weight, weights.k_zero, weights.k_scale, workspace.k.handle,
+        weights.v_weight, weights.v_zero, weights.v_scale, workspace.v.handle,
+        weights.q_norm, weights.k_norm,
         workspace.cos.handle, workspace.sin.handle,
         workspace.q_rotated.handle, workspace.k_rotated.handle,
-        workspace.k_cache[layer_idx].handle, workspace.v_cache[layer_idx].handle,
+        workspace.k_cache[layer_idx].handle,
+        workspace.v_cache[layer_idx].handle,
         workspace.sinks.handle, workspace.attention.handle,
-        1, hq, hkv, 1, hd, position, workspace.capacity, 0, False,
-        1.0 / (hd ** 0.5),
+        weights.o_weight, weights.o_zero, weights.o_scale,
+        workspace.projected.handle, workspace.residual.handle,
+        weights.post_norm, workspace.post_normalized.handle,
+        weights.gate_weight, weights.gate_zero, weights.gate_scale,
+        workspace.gate.handle,
+        weights.up_weight, weights.up_zero, weights.up_scale,
+        workspace.up.handle, workspace.activated.handle,
+        weights.down_weight, weights.down_zero, weights.down_scale,
+        workspace.mlp_output.handle, workspace.hidden[output_slot].handle,
+        workspace.awq_partials.handle,
+        cfg.hidden_size, cfg.intermediate_size,
+        cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+        position, workspace.capacity, cfg.rms_norm_eps,
+        1.0 / (cfg.head_dim ** 0.5),
     )
-    linear(workspace.attention, weights.o_weight, weights.o_zero, weights.o_scale, workspace.projected, d, cfg.query_size)
-    ext.add_resident(workspace.projected.handle, x.handle, workspace.residual.handle, d)
-    ext.rmsnorm_resident(workspace.residual.handle, weights.post_norm, workspace.post_normalized.handle, 1, d, cfg.rms_norm_eps)
-    linear(workspace.post_normalized, weights.gate_weight, weights.gate_zero, weights.gate_scale, workspace.gate, cfg.intermediate_size, d)
-    linear(workspace.post_normalized, weights.up_weight, weights.up_zero, weights.up_scale, workspace.up, cfg.intermediate_size, d)
-    ext.swiglu_resident(workspace.gate.handle, workspace.up.handle, workspace.activated.handle, cfg.intermediate_size)
-    linear(workspace.activated, weights.down_weight, weights.down_zero, weights.down_scale, workspace.mlp_output, d, cfg.intermediate_size)
-    ext.add_resident(workspace.residual.handle, workspace.mlp_output.handle, out.handle, d)
     return output_slot
 
 

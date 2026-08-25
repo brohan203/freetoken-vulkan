@@ -100,7 +100,10 @@ workgroup to 128 adjacent output columns, matching the checkpoint's
 
 The AWQ matvec now uses two stages. Stage 1 splits K into 1,024-element chunks
 and writes partial sums; stage 2 reduces chunks per output. This increases GPU
-parallelism substantially for the large down projection.
+parallelism substantially for the large down projection. The layer dispatches
+all four two-stage AWQ projections inside the same command buffer as RMSNorm,
+RoPE, KV append, GQA attention, SwiGLU, and residual operations, with explicit
+compute barriers between dependent stages.
 
 Standalone measurements:
 
@@ -110,14 +113,14 @@ Standalone measurements:
 
 Eight-token generation remains identical while performance improves:
 
-- prompt processing: `0.147 s/token`
-- decode: `0.142 s/token` (about 7.05 tokens/second)
-- about 6.5x faster than the first resident path (`0.918 s/token`)
+- prompt processing: `0.115 s/token`
+- decode: `0.116 s/token` (about 8.6 tokens/second)
+- about 7.9x faster than the first resident path (`0.918 s/token`)
 
 A forced 320-token run at max sequence 384 completed with:
 
-- total runtime: `48.35 s`
-- decode average: `0.1473 s/token`
+- total runtime: `39.88 s`
+- decode average: `0.1214 s/token`
 - steady resident allocation: `10,104,658,592` bytes
 - identical resident bytes before and after generation
 - successful explicit cleanup
