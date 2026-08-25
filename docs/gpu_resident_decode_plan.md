@@ -92,6 +92,26 @@ Correctness gate:
 - router top-4 IDs are identical on a recorded 120b trace;
 - one-layer final output remains within established FP32 tolerance.
 
+### Phase 2 foundation status
+
+Implemented and validated:
+
+- handle-based resident FP32 linear projection;
+- fused resident RMSNorm + Q/K/V projection in one submission;
+- explicit compute write-to-read barrier between normalization and matvecs;
+- real 20b projection weights and activations.
+
+Correctness and performance:
+
+- resident RMSNorm + Q projection max error `2.29e-5`;
+- fused Q/K/V max errors `3.05e-5`, `3.43e-5`, and `2.48e-5`;
+- fused resident RMSNorm + Q/K/V: `0.262 ms`;
+- equivalent CPU chain at 12 threads: `1.777 ms`;
+- local speedup approximately 6.8x.
+
+The next Phase 2 step is resident O projection + residual, post-attention
+RMSNorm, and router projection/top-K before full layer batching.
+
 ## Phase 3: one submit per layer
 
 Record a layer command buffer containing:

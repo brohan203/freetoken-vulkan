@@ -753,6 +753,71 @@ torch::Tensor rope_partial_vulkan(torch::Tensor x, torch::Tensor cos,
 // W and B are referenced by resident-VRAM handles; x is transient.
 // Suitable for LM head, Q/K/V/O projections, router, etc.
 // ============================================================
+void rmsnorm_qkv_resident_vulkan(
+    int64_t x_handle, int64_t norm_weight_handle,
+    int64_t normalized_handle,
+    int64_t q_weight_handle, int64_t q_bias_handle, int64_t q_handle,
+    int64_t k_weight_handle, int64_t k_bias_handle, int64_t k_handle,
+    int64_t v_weight_handle, int64_t v_bias_handle, int64_t v_handle,
+    int64_t rows, int64_t hidden, int64_t q_size, int64_t kv_size,
+    double eps) {
+    auto& ctx = get_ctx();
+    auto& norm = get_pipeline("rmsnorm_f32.comp.spv", 3, 8);
+    auto& linear = get_pipeline("linear_fp32_resident_f32.comp.spv", 4, 16);
+    struct NormPC { uint32_t H; float eps; } norm_pc = {
+        (uint32_t)hidden, (float)eps};
+    struct LinearPC { uint32_t T, N, K, use_bias; };
+    LinearPC q_pc{(uint32_t)rows,(uint32_t)q_size,(uint32_t)hidden,1u};
+    LinearPC kv_pc{(uint32_t)rows,(uint32_t)kv_size,(uint32_t)hidden,1u};
+    VkDescriptorSet norm_set = make_descriptor_set(norm, {
+        resident_buf(x_handle), resident_buf(norm_weight_handle),
+        resident_buf(normalized_handle)});
+    auto make_linear = [&](int64_t w, int64_t b, int64_t out) {
+        return make_descriptor_set(linear, {
+            resident_buf(w), resident_buf(b), resident_buf(normalized_handle),
+            resident_buf(out)});
+    };
+    VkDescriptorSet q_set=make_linear(q_weight_handle,q_bias_handle,q_handle);
+    VkDescriptorSet k_set=make_linear(k_weight_handle,k_bias_handle,k_handle);
+    VkDescriptorSet v_set=make_linear(v_weight_handle,v_bias_handle,v_handle);
+    vku::submit_and_wait(ctx,[&](VkCommandBuffer cmd){
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,norm.pipeline);
+        vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,norm.pipeline_layout,0,1,&norm_set,0,nullptr);
+        vkCmdPushConstants(cmd,norm.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,&norm_pc);
+        vkCmdDispatch(cmd,(uint32_t)rows,1,1);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+        auto dispatch=[&](VkDescriptorSet set,const LinearPC& pc){
+            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline);
+            vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,linear.pipeline_layout,0,1,&set,0,nullptr);
+            vkCmdPushConstants(cmd,linear.pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,&pc);
+            vkCmdDispatch(cmd,pc.N,pc.T,1);
+        };
+        dispatch(q_set,q_pc);dispatch(k_set,kv_pc);dispatch(v_set,kv_pc);
+    });
+}
+
+void linear_resident_io_vulkan(
+    int64_t x_handle, int64_t h_w, int64_t h_b, int64_t y_handle,
+    int64_t T, int64_t N, int64_t K, bool use_bias) {
+    const size_t x_bytes = (size_t)T * K * sizeof(float);
+    const size_t y_bytes = (size_t)T * N * sizeof(float);
+    TORCH_CHECK(g_resident.at(x_handle).size >= x_bytes, "resident x too small");
+    TORCH_CHECK(g_resident.at(y_handle).size >= y_bytes, "resident y too small");
+    TORCH_CHECK(g_resident.at(h_w).size >= (size_t)N*K*sizeof(float),
+                "resident weight too small");
+    auto& pipe = get_pipeline("linear_fp32_resident_f32.comp.spv", 4, 16);
+    struct PC { uint32_t T, N, K, use_bias; } pc = {
+        (uint32_t)T, (uint32_t)N, (uint32_t)K,
+        use_bias ? 1u : 0u
+    };
+    VkBuffer weight = resident_buf(h_w);
+    VkBuffer bias = use_bias ? resident_buf(h_b) : weight;
+    run_kernel(pipe, {weight, bias, resident_buf(x_handle),
+                      resident_buf(y_handle)},
+               &pc, (uint32_t)N, (uint32_t)T, 1);
+}
+
 torch::Tensor linear_resident_vulkan(
     torch::Tensor x,           // [T, K] fp32
     int64_t h_w,               // W handle [N, K] fp32
@@ -1388,6 +1453,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("h_gu_blocks"), py::arg("h_gu_scales"), py::arg("h_gu_bias"),
           py::arg("h_d_blocks"),  py::arg("h_d_scales"),  py::arg("h_d_bias"),
           py::arg("E"), py::arg("D"), py::arg("Dff"));
+    m.def("rmsnorm_qkv_resident", &rmsnorm_qkv_resident_vulkan,
+          "Fused resident RMSNorm followed by Q, K, and V projections.",
+          py::arg("x_handle"), py::arg("norm_weight_handle"),
+          py::arg("normalized_handle"),
+          py::arg("q_weight_handle"), py::arg("q_bias_handle"),
+          py::arg("q_handle"), py::arg("k_weight_handle"),
+          py::arg("k_bias_handle"), py::arg("k_handle"),
+          py::arg("v_weight_handle"), py::arg("v_bias_handle"),
+          py::arg("v_handle"), py::arg("rows"), py::arg("hidden"),
+          py::arg("q_size"), py::arg("kv_size"),
+          py::arg("eps") = 1e-5);
+    m.def("linear_resident_io", &linear_resident_io_vulkan,
+          "FP32 linear layer with resident input, weight, bias, and output.",
+          py::arg("x_handle"), py::arg("w_handle"), py::arg("b_handle"),
+          py::arg("y_handle"), py::arg("T"), py::arg("N"), py::arg("K"),
+          py::arg("use_bias") = true);
     m.def("linear_resident", &linear_resident_vulkan,
           "FP32 linear layer y = x @ W.T + b where W [N,K] and b [N] live "
           "in resident VRAM. Suitable for LM head and Q/K/V/O projections.",
