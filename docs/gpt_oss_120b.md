@@ -128,6 +128,12 @@ FREETOKEN_PREFILL_CHUNK
 FREETOKEN_CPU_THREADS
 ```
 
+For repeated prompts, `python/chat_120b.py` keeps the model and expert cache
+alive across requests. In a measured four-request sequence, the first
+`The capital of France is` request took about 10.0 seconds; repeating the same
+prompt later in the process took about 6.2 seconds. Prefill fell from 3.66 to
+0.99 seconds and cache hit rate rose from 53.5 to 66.8 percent.
+
 Recommended defaults:
 
 ```text

@@ -59,6 +59,19 @@ pip install torch transformers safetensors
 #    then run under a vcvars64-wrapped shell so the torch JIT ext compiles.
 ```
 
+For gpt-oss-120b, use the long-lived prompt loop so the expert cache stays
+warm across requests:
+
+```powershell
+python\chat_120b.py --max-new-tokens 48 "The capital of France is"
+
+# Or start an interactive loop:
+python\chat_120b.py --max-new-tokens 48
+```
+
+The model, LM head, and 24-slot-per-layer LFU expert cache are initialized only
+once. Repeated prompts can be significantly faster as the expert cache warms.
+
 ## Sample output - real, from `demo_long_gen.py`
 
 Prompt: `"def fibonacci(n):"`
